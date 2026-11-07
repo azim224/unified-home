@@ -1,0 +1,107 @@
+name: Build unified-home plugin
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install D8
+        run: sdkmanager "build-tools;35.0.0"
+
+      # Скачиваем готовый amalia-native-sdk из последней успешной сборки amalia-3.0
+      - name: Download amalia-native-sdk
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.AMALIA_TOKEN }}
+          repo: azim224/amalia-3.0
+          workflow: native-sdk.yml
+          name: amalia-native-sdk
+          path: ${{ runner.temp }}/native-sdk-download
+          search_artifacts: true
+          if_no_artifact_found: fail
+
+      - name: Extract and verify SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/native-sdk"
+          unzip -q "$RUNNER_TEMP/native-sdk-download/amalia-native-sdk.zip" \
+            -d "$RUNNER_TEMP/native-sdk"
+          cd "$RUNNER_TEMP/native-sdk"
+          sha256sum --check SHA256SUMS
+          python3 -c "
+          import json
+          sdk = json.load(open('sdk.json'))
+          plugin = json.load(open('$GITHUB_WORKSPACE/android/native-plugin.json'))
+          assert sdk['abi'] == plugin['abi'], \
+            f\"ABI mismatch: sdk={sdk['abi']} plugin={plugin['abi']}\"
+          print('ABI OK:', sdk['abi'])
+          "
+
+      - name: Compile plugin JAR
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew jar --no-daemon --console=plain \
+            -PamaliaNativeSdk="${{ runner.temp }}/native-sdk"
+
+      - name: Clone amalia tools (sparse)
+        shell: bash
+        run: |
+          git clone --depth=1 --filter=blob:none --sparse \
+            "https://azim224:${{ secrets.AMALIA_TOKEN }}@github.com/azim224/amalia-3.0.git" \
+            "$RUNNER_TEMP/amalia-tools"
+          cd "$RUNNER_TEMP/amalia-tools"
+          git sparse-checkout set tools
+
+      - name: Sign and package .amaliaplug
+        shell: bash
+        run: |
+          set -euo pipefail
+          D8="$(ls -d "$ANDROID_HOME"/build-tools/*/d8 2>/dev/null | sort -V | tail -1)"
+          [ -x "$D8" ] || { echo "d8 not found"; exit 1; }
+          echo "d8: $D8"
+
+          openssl ecparam -name prime256v1 -genkey -noout \
+            -out "$RUNNER_TEMP/publisher.pem"
+
+          python3 "$RUNNER_TEMP/amalia-tools/tools/native_plugin.py" package \
+            --project "$GITHUB_WORKSPACE/android" \
+            --sdk "$RUNNER_TEMP/native-sdk" \
+            --private-key "$RUNNER_TEMP/publisher.pem" \
+            --key-id ci-ephemeral \
+            --d8 "$D8"
+
+          ls -lh "$GITHUB_WORKSPACE/android/dist/"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unified-home-plugin
+          path: android/dist/*.amaliaplug
+          if-no-files-found: error
+
+      - name: Create GitHub Release on tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: android/dist/*.amaliaplug
