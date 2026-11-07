@@ -22,12 +22,17 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
+      - name: Install D8 via sdkmanager
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SM="$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)"
+          echo "sdkmanager: $SM"
+          (yes || true) | "$SM" --licenses >/dev/null 2>&1 || true
+          "$SM" "build-tools;35.0.0"
+          echo "build-tools: $(ls "$SDK/build-tools")"
 
-      - name: Install D8
-        run: sdkmanager "build-tools;35.0.0"
-
-      # Скачиваем готовый amalia-native-sdk из последней успешной сборки amalia-3.0
       - name: Download amalia-native-sdk
         uses: dawidd6/action-download-artifact@v6
         with:
@@ -49,13 +54,13 @@ jobs:
           cd "$RUNNER_TEMP/native-sdk"
           sha256sum --check SHA256SUMS
           python3 -c "
-          import json
-          sdk = json.load(open('sdk.json'))
-          plugin = json.load(open('$GITHUB_WORKSPACE/android/native-plugin.json'))
-          assert sdk['abi'] == plugin['abi'], \
-            f\"ABI mismatch: sdk={sdk['abi']} plugin={plugin['abi']}\"
-          print('ABI OK:', sdk['abi'])
-          "
+import json
+sdk    = json.load(open('sdk.json'))
+plugin = json.load(open('$GITHUB_WORKSPACE/android/native-plugin.json'))
+assert sdk['abi'] == plugin['abi'], \
+  f\"ABI mismatch: sdk={sdk['abi']} plugin={plugin['abi']}\"
+print('ABI OK:', sdk['abi'])
+"
 
       - name: Compile plugin JAR
         working-directory: android
@@ -77,8 +82,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          D8="$(ls -d "$ANDROID_HOME"/build-tools/*/d8 2>/dev/null | sort -V | tail -1)"
-          [ -x "$D8" ] || { echo "d8 not found"; exit 1; }
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          D8="$(ls -d "$SDK"/build-tools/*/d8 2>/dev/null | sort -V | tail -1)"
+          [ -x "$D8" ] || { echo "d8 not found in $SDK/build-tools"; exit 1; }
           echo "d8: $D8"
 
           openssl ecparam -name prime256v1 -genkey -noout \
