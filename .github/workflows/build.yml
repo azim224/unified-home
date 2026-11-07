@@ -101,7 +101,9 @@ jobs:
         working-directory: amalia-host
         run: |
           chmod +x gradlew
-          ./gradlew :app:exportNativeSdk --no-daemon --console=plain
+          # The exporter resolves cross-project classpaths; configure all projects first.
+          ./gradlew :app:exportNativeSdk --no-configure-on-demand --no-parallel \
+            --no-daemon --console=plain --stacktrace
           git rev-parse HEAD > "$RUNNER_TEMP/host-commit.txt"
           git diff -- app/build.gradle.kts > "$RUNNER_TEMP/host-sdk-config.patch"
 
