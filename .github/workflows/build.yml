@@ -95,6 +95,14 @@ jobs:
               raise SystemExit('SDK JAR metadata filter changed; review required')
           exporter.write_text(exporter_source.replace(
               old, "('.class', '.kotlin_module', '.kotlin_metadata', '.kotlin_builtins')"))
+          # Kotlin value-class mangling can put '-' in generated JVM class names.
+          cli = pathlib.Path('amalia-host/tools/amalia_cli.py')
+          cli_source = cli.read_text()
+          old = r'[A-Za-z_$][A-Za-z0-9_$]*(?:/[A-Za-z_$][A-Za-z0-9_$]*)*\.class'
+          new = r'[A-Za-z_$][A-Za-z0-9_$-]*(?:/[A-Za-z_$][A-Za-z0-9_$-]*)*\.class'
+          if cli_source.count(old) != 1:
+              raise SystemExit('Program JAR class-name validator changed; review required')
+          cli.write_text(cli_source.replace(old, new))
           print(platform)
           PY
           )"
@@ -113,7 +121,7 @@ jobs:
           ./gradlew :app:exportNativeSdk --no-configure-on-demand --no-parallel \
             --no-daemon --console=plain --stacktrace
           git rev-parse HEAD > "$RUNNER_TEMP/host-commit.txt"
-          git diff -- app/build.gradle.kts tools/ExportNativeSdk.py > "$RUNNER_TEMP/host-sdk-config.patch"
+          git diff -- app/build.gradle.kts tools/ExportNativeSdk.py tools/amalia_cli.py > "$RUNNER_TEMP/host-sdk-config.patch"
 
       - name: Extract and verify SDK and plugin manifest
         shell: bash
