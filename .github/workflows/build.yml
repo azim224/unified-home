@@ -10,7 +10,7 @@ on:
       host_ref:
         description: "Amalia host branch, tag or commit (must match the installed host)"
         required: true
-        default: "v2.0"
+        default: "azim224"
         type: string
 
 permissions:
@@ -44,7 +44,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: azim224/amalia-3.0
-          ref: ${{ inputs.host_ref || 'v2.0' }}
+          ref: ${{ inputs.host_ref || 'azim224' }}
           token: ${{ secrets.AMALIA_TOKEN }}
           path: amalia-host
           persist-credentials: false
