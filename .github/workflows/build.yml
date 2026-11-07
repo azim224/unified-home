@@ -87,6 +87,14 @@ jobs:
                   raise SystemExit('Host exporter platform path changed; review required')
               source = source.replace(old, 'platforms/android-$compileSdkApi.0/android.jar')
               pathlib.Path('amalia-host/app/build.gradle.kts').write_text(source)
+          # Preserve stdlib built-in metadata when normalizing SDK JARs.
+          exporter = pathlib.Path('amalia-host/tools/ExportNativeSdk.py')
+          exporter_source = exporter.read_text()
+          old = "('.class', '.kotlin_module', '.kotlin_metadata')"
+          if old not in exporter_source:
+              raise SystemExit('SDK JAR metadata filter changed; review required')
+          exporter.write_text(exporter_source.replace(
+              old, "('.class', '.kotlin_module', '.kotlin_metadata', '.kotlin_builtins')"))
           print(platform)
           PY
           )"
@@ -105,7 +113,7 @@ jobs:
           ./gradlew :app:exportNativeSdk --no-configure-on-demand --no-parallel \
             --no-daemon --console=plain --stacktrace
           git rev-parse HEAD > "$RUNNER_TEMP/host-commit.txt"
-          git diff -- app/build.gradle.kts > "$RUNNER_TEMP/host-sdk-config.patch"
+          git diff -- app/build.gradle.kts tools/ExportNativeSdk.py > "$RUNNER_TEMP/host-sdk-config.patch"
 
       - name: Extract and verify SDK and plugin manifest
         shell: bash
