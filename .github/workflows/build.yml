@@ -71,12 +71,28 @@ jobs:
           match = re.search(r'^\s*compileSdk\s*=\s*(\d+)\s*$', source, re.M)
           if not match:
               raise SystemExit('Cannot determine host compileSdk')
-          print(match[1])
+          api = int(match[1])
+          # Google publishes API 37+ with an explicit minor version (37.0).
+          platform = f'{api}.0' if api >= 37 else str(api)
+          if api >= 37:
+              source, count = re.subn(
+                  r'^(\s*)compileSdk\s*=\s*\d+\s*$',
+                  rf'\1compileSdk = {api}\n\1compileSdkMinor = 0',
+                  source, count=1, flags=re.M)
+              if count != 1:
+                  raise SystemExit('Cannot configure explicit compileSdk minor version')
+              # The host exporter also constructs the platform path manually.
+              old = 'platforms/android-$compileSdkApi/android.jar'
+              if old not in source:
+                  raise SystemExit('Host exporter platform path changed; review required')
+              source = source.replace(old, 'platforms/android-$compileSdkApi.0/android.jar')
+              pathlib.Path('amalia-host/app/build.gradle.kts').write_text(source)
+          print(platform)
           PY
           )"
           # Consume all input rather than yes | sdkmanager under pipefail (SIGPIPE).
           "$SM" --licenses > /dev/null <<< "$(printf 'y\n%.0s' {1..100})"
-          "$SM" --channel=3 "platforms;android-$API" "build-tools;35.0.0"
+          "$SM" "platforms;android-$API" "build-tools;35.0.0"
           test -f "$SDK/platforms/android-$API/android.jar"
           test -x "$SDK/build-tools/35.0.0/d8"
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
@@ -87,6 +103,7 @@ jobs:
           chmod +x gradlew
           ./gradlew :app:exportNativeSdk --no-daemon --console=plain
           git rev-parse HEAD > "$RUNNER_TEMP/host-commit.txt"
+          git diff -- app/build.gradle.kts > "$RUNNER_TEMP/host-sdk-config.patch"
 
       - name: Extract and verify SDK and plugin manifest
         shell: bash
@@ -122,6 +139,7 @@ jobs:
           openssl pkey -in "$RUNNER_TEMP/publisher.pem" -pubout \
             -out android/dist/publisher-public.pem
           cp "$RUNNER_TEMP/host-commit.txt" android/dist/host-commit.txt
+          cp "$RUNNER_TEMP/host-sdk-config.patch" android/dist/host-sdk-config.patch
           ls -lh android/dist/
 
       - name: Upload artifact
@@ -132,6 +150,7 @@ jobs:
             android/dist/*.amaliaplug
             android/dist/publisher-public.pem
             android/dist/host-commit.txt
+            android/dist/host-sdk-config.patch
           if-no-files-found: error
 
   release:
@@ -151,3 +170,4 @@ jobs:
             dist/*.amaliaplug
             dist/publisher-public.pem
             dist/host-commit.txt
+            dist/host-sdk-config.patch
