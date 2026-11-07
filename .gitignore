@@ -1,0 +1,9 @@
+.gradle/
+build/
+*.class
+local.properties
+verification/compiler.log
+verification/CheckKotlinSyntax.class
+backup-before-fixes/
+backup-before-home-v2/
+draft-*.kt
