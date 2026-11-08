@@ -25,9 +25,31 @@ jobs:
       GROQ_API_KEY: ""
       ASSEMBLYAI_API_KEY: ""
       FISH_AUDIO_API_KEY: ""
+      UNIFIED_HOME_KEY_ID: ${{ vars.UNIFIED_HOME_KEY_ID || 'unified-home-1' }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate persistent publisher signing key
+        shell: bash
+        env:
+          UNIFIED_HOME_SIGNING_KEY: ${{ secrets.UNIFIED_HOME_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$UNIFIED_HOME_SIGNING_KEY" ]; then
+            echo "::error::Set repository secret UNIFIED_HOME_SIGNING_KEY to a persistent PEM P-256 private key (generate once locally with openssl ecparam -name prime256v1 -genkey -noout). Set repository variable UNIFIED_HOME_KEY_ID to its fixed ID (default unified-home-1). Fork PRs do not receive secrets. No random fallback is allowed."
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$UNIFIED_HOME_SIGNING_KEY" > "$RUNNER_TEMP/unified-home-publisher.pem"
+          openssl pkey -in "$RUNNER_TEMP/unified-home-publisher.pem" -check -noout > /dev/null
+          openssl pkey -in "$RUNNER_TEMP/unified-home-publisher.pem" -pubout \
+            -out "$RUNNER_TEMP/unified-home-publisher-public.pem"
+          if ! openssl ec -pubin -in "$RUNNER_TEMP/unified-home-publisher-public.pem" \
+              -text -noout 2>/dev/null | grep -Eq '^ *ASN1 OID: prime256v1$'; then
+            echo "::error::UNIFIED_HOME_SIGNING_KEY must be an EC P-256 (prime256v1) private key."
+            exit 1
+          fi
 
       - name: Check host repository access
         shell: bash
@@ -100,9 +122,10 @@ jobs:
           cli_source = cli.read_text()
           old = r'[A-Za-z_$][A-Za-z0-9_$]*(?:/[A-Za-z_$][A-Za-z0-9_$]*)*\.class'
           new = r'[A-Za-z_$][A-Za-z0-9_$-]*(?:/[A-Za-z_$][A-Za-z0-9_$-]*)*\.class'
-          if cli_source.count(old) != 1:
+          if cli_source.count(old) == 1 and cli_source.count(new) == 0:
+              cli.write_text(cli_source.replace(old, new))
+          elif cli_source.count(old) != 0 or cli_source.count(new) != 1:
               raise SystemExit('Program JAR class-name validator changed; review required')
-          cli.write_text(cli_source.replace(old, new))
           print(platform)
           PY
           )"
@@ -145,20 +168,32 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          openssl ecparam -name prime256v1 -genkey -noout \
-            -out "$RUNNER_TEMP/publisher.pem"
           python3 amalia-host/tools/native_plugin.py package \
             --project "$GITHUB_WORKSPACE/android" \
             --sdk "$RUNNER_TEMP/native-sdk" \
-            --private-key "$RUNNER_TEMP/publisher.pem" \
-            --key-id ci-ephemeral \
+            --private-key "$RUNNER_TEMP/unified-home-publisher.pem" \
+            --key-id "$UNIFIED_HOME_KEY_ID" \
             --d8 "$ANDROID_HOME/build-tools/35.0.0/d8"
-          # Only the PUBLIC key is distributed, so this CI build can be pinned in the host.
-          openssl pkey -in "$RUNNER_TEMP/publisher.pem" -pubout \
-            -out android/dist/publisher-public.pem
+          cp "$RUNNER_TEMP/unified-home-publisher-public.pem" android/dist/publisher-public.pem
+          FINGERPRINT="$(openssl pkey -pubin -in android/dist/publisher-public.pem \
+            -outform DER | openssl dgst -sha256 | awk '{print $NF}')"
+          {
+            printf 'publisher: org.amalia\nkeyId: %s\npublicKeyDerSha256: %s\n' "$UNIFIED_HOME_KEY_ID" "$FINGERPRINT"
+            printf '%s\n' \
+              'Pin publisher-public.pem for publisher org.amalia with the exact keyId above; verify its public DER SHA-256 fingerprint.' \
+              'Save this public key under the exact publisher and keyId above (replace a stale pin if necessary), then fully stop the Amalia host process and reopen it before importing the matching .amaliaplug.' \
+              'Review android.native and the platform.json digest before activation.' \
+              'An existing ci-ephemeral package requires the public key from that exact build, not this new persistent key.' \
+              'Kotlin DEX class names containing hyphens require an updated host loader; repackaging the plugin alone cannot fix an old host.'
+          } > android/dist/publisher-info.txt
           cp "$RUNNER_TEMP/host-commit.txt" android/dist/host-commit.txt
           cp "$RUNNER_TEMP/host-sdk-config.patch" android/dist/host-sdk-config.patch
           ls -lh android/dist/
+
+      - name: Remove temporary private signing key
+        if: always()
+        shell: bash
+        run: rm -f -- "$RUNNER_TEMP/unified-home-publisher.pem"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -167,6 +202,7 @@ jobs:
           path: |
             android/dist/*.amaliaplug
             android/dist/publisher-public.pem
+            android/dist/publisher-info.txt
             android/dist/host-commit.txt
             android/dist/host-sdk-config.patch
           if-no-files-found: error
@@ -187,5 +223,6 @@ jobs:
           files: |
             dist/*.amaliaplug
             dist/publisher-public.pem
+            dist/publisher-info.txt
             dist/host-commit.txt
             dist/host-sdk-config.patch
