@@ -7,3 +7,11 @@ verification/CheckKotlinSyntax.class
 backup-before-fixes/
 backup-before-home-v2/
 draft-*.kt
+
+dist/
+amalia-native-sdk/
+__pycache__/
+*.pem
+*.key
+/sdk-download.zip
+/verification/new-build.log

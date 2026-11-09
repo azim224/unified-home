@@ -7,10 +7,9 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
-      host_ref:
-        description: "Amalia host branch, tag or commit (must match the installed host)"
+      sdk_run_id:
+        description: "Successful Native SDK distribution run ID for the installed host"
         required: true
-        default: "azim224"
         type: string
 
 permissions:
@@ -21,10 +20,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      # SDK export rejects builds containing application credentials.
-      GROQ_API_KEY: ""
-      ASSEMBLYAI_API_KEY: ""
-      FISH_AUDIO_API_KEY: ""
       UNIFIED_HOME_KEY_ID: ${{ vars.UNIFIED_HOME_KEY_ID || 'unified-home-1' }}
 
     steps:
@@ -51,111 +46,50 @@ jobs:
             exit 1
           fi
 
-      - name: Check host repository access
+      - name: Download prebuilt exact-host SDK (never compile the host)
         shell: bash
         env:
-          AMALIA_TOKEN: ${{ secrets.AMALIA_TOKEN }}
+          GH_TOKEN: ${{ secrets.AMALIA_TOKEN }}
+          SDK_RUN_ID: ${{ inputs.sdk_run_id || vars.AMALIA_SDK_RUN_ID }}
         run: |
           set -euo pipefail
-          if [ -z "$AMALIA_TOKEN" ]; then
-            echo "::error::Set AMALIA_TOKEN with read access to azim224/amalia-3.0. Fork PRs do not receive this secret."
-            exit 1
-          fi
-
-      - name: Check out matching host SDK exporter and packaging tools
-        uses: actions/checkout@v4
-        with:
-          repository: azim224/amalia-3.0
-          ref: ${{ inputs.host_ref || 'azim224' }}
-          token: ${{ secrets.AMALIA_TOKEN }}
-          path: amalia-host
-          persist-credentials: false
+          [ -n "$GH_TOKEN" ] || { echo "::error::Set AMALIA_TOKEN with Actions read access to azim224/amalia-3.0"; exit 1; }
+          [[ "$SDK_RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::Set sdk_run_id or AMALIA_SDK_RUN_ID to the successful exact-host SDK run ID"; exit 1; }
+          gh api "repos/azim224/amalia-3.0/actions/runs/$SDK_RUN_ID" > "$RUNNER_TEMP/sdk-run.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          run = json.loads((root / 'sdk-run.json').read_text())
+          if (run['path'] != '.github/workflows/native-sdk.yml'
+                  or run['status'] != 'completed' or run['conclusion'] != 'success'):
+              raise SystemExit('Select a successful Native SDK distribution run, not an APK/plugin run')
+          (root / 'host-commit.txt').write_text(run['head_sha'] + '\n')
+          PY
+          gh run download "$SDK_RUN_ID" --repo azim224/amalia-3.0 \
+            --name amalia-native-sdk --dir "$RUNNER_TEMP/sdk-download"
+          mkdir -p "$RUNNER_TEMP/native-sdk"
+          unzip -q "$RUNNER_TEMP/sdk-download/amalia-native-sdk.zip" -d "$RUNNER_TEMP/native-sdk"
+          (cd "$RUNNER_TEMP/native-sdk" && sha256sum --check SHA256SUMS)
+          python3 tools/native_plugin.py validate \
+            --project "$GITHUB_WORKSPACE/android" --sdk "$RUNNER_TEMP/native-sdk"
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Install compile SDK and D8 (no obsolete tools package)
+      - name: Install D8 only (no host compile SDK or APK)
         shell: bash
         run: |
           set -euo pipefail
           SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          if [ ! -x "$SM" ]; then
-            SM="$(command -v sdkmanager || true)"
-          fi
           [ -x "$SM" ] || { echo "::error::sdkmanager not found"; exit 1; }
-          API="$(python3 - <<'PY'
-          import pathlib
-          import re
-          source = pathlib.Path('amalia-host/app/build.gradle.kts').read_text()
-          match = re.search(r'^\s*compileSdk\s*=\s*(\d+)\s*$', source, re.M)
-          if not match:
-              raise SystemExit('Cannot determine host compileSdk')
-          api = int(match[1])
-          # Google publishes API 37+ with an explicit minor version (37.0).
-          platform = f'{api}.0' if api >= 37 else str(api)
-          if api >= 37:
-              source, count = re.subn(
-                  r'^(\s*)compileSdk\s*=\s*\d+\s*$',
-                  rf'\1compileSdk = {api}\n\1compileSdkMinor = 0',
-                  source, count=1, flags=re.M)
-              if count != 1:
-                  raise SystemExit('Cannot configure explicit compileSdk minor version')
-              # The host exporter also constructs the platform path manually.
-              old = 'platforms/android-$compileSdkApi/android.jar'
-              if old not in source:
-                  raise SystemExit('Host exporter platform path changed; review required')
-              source = source.replace(old, 'platforms/android-$compileSdkApi.0/android.jar')
-              pathlib.Path('amalia-host/app/build.gradle.kts').write_text(source)
-          # Preserve stdlib built-in metadata when normalizing SDK JARs.
-          exporter = pathlib.Path('amalia-host/tools/ExportNativeSdk.py')
-          exporter_source = exporter.read_text()
-          old = "('.class', '.kotlin_module', '.kotlin_metadata')"
-          if old not in exporter_source:
-              raise SystemExit('SDK JAR metadata filter changed; review required')
-          exporter.write_text(exporter_source.replace(
-              old, "('.class', '.kotlin_module', '.kotlin_metadata', '.kotlin_builtins')"))
-          # Kotlin value-class mangling can put '-' in generated JVM class names.
-          cli = pathlib.Path('amalia-host/tools/amalia_cli.py')
-          cli_source = cli.read_text()
-          old = r'[A-Za-z_$][A-Za-z0-9_$]*(?:/[A-Za-z_$][A-Za-z0-9_$]*)*\.class'
-          new = r'[A-Za-z_$][A-Za-z0-9_$-]*(?:/[A-Za-z_$][A-Za-z0-9_$-]*)*\.class'
-          if cli_source.count(old) == 1 and cli_source.count(new) == 0:
-              cli.write_text(cli_source.replace(old, new))
-          elif cli_source.count(old) != 0 or cli_source.count(new) != 1:
-              raise SystemExit('Program JAR class-name validator changed; review required')
-          print(platform)
-          PY
-          )"
-          # Consume all input rather than yes | sdkmanager under pipefail (SIGPIPE).
           "$SM" --licenses > /dev/null <<< "$(printf 'y\n%.0s' {1..100})"
-          "$SM" "platforms;android-$API" "build-tools;35.0.0"
-          test -f "$SDK/platforms/android-$API/android.jar"
+          "$SM" "build-tools;35.0.0"
           test -x "$SDK/build-tools/35.0.0/d8"
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-
-      - name: Export exact-host native SDK (compile classes only, no APK)
-        working-directory: amalia-host
-        run: |
-          chmod +x gradlew
-          # The exporter resolves cross-project classpaths; configure all projects first.
-          ./gradlew :app:exportNativeSdk --no-configure-on-demand --no-parallel \
-            --no-daemon --console=plain --stacktrace
-          git rev-parse HEAD > "$RUNNER_TEMP/host-commit.txt"
-          git diff -- app/build.gradle.kts tools/ExportNativeSdk.py tools/amalia_cli.py > "$RUNNER_TEMP/host-sdk-config.patch"
-
-      - name: Extract and verify SDK and plugin manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/native-sdk"
-          unzip -q amalia-host/app/build/outputs/native-sdk/amalia-native-sdk.zip \
-            -d "$RUNNER_TEMP/native-sdk"
-          (cd "$RUNNER_TEMP/native-sdk" && sha256sum --check SHA256SUMS)
-          python3 amalia-host/tools/native_plugin.py validate \
-            --project "$GITHUB_WORKSPACE/android" --sdk "$RUNNER_TEMP/native-sdk"
 
       - name: Compile plugin JAR
         working-directory: android
@@ -164,11 +98,14 @@ jobs:
           ./gradlew jar --no-daemon --console=plain \
             -PamaliaNativeSdk="$RUNNER_TEMP/native-sdk"
 
+      - name: Verify thin plugin JAR
+        run: python3 tools/check_plugin.py --jar android/build/libs/unified-home.jar
+
       - name: Sign and package .amaliaplug
         shell: bash
         run: |
           set -euo pipefail
-          python3 amalia-host/tools/native_plugin.py package \
+          python3 tools/native_plugin.py package \
             --project "$GITHUB_WORKSPACE/android" \
             --sdk "$RUNNER_TEMP/native-sdk" \
             --private-key "$RUNNER_TEMP/unified-home-publisher.pem" \
@@ -187,7 +124,7 @@ jobs:
               'Kotlin DEX class names containing hyphens require an updated host loader; repackaging the plugin alone cannot fix an old host.'
           } > android/dist/publisher-info.txt
           cp "$RUNNER_TEMP/host-commit.txt" android/dist/host-commit.txt
-          cp "$RUNNER_TEMP/host-sdk-config.patch" android/dist/host-sdk-config.patch
+          python3 tools/check_plugin.py android/dist/*.amaliaplug
           ls -lh android/dist/
 
       - name: Remove temporary private signing key
@@ -204,7 +141,6 @@ jobs:
             android/dist/publisher-public.pem
             android/dist/publisher-info.txt
             android/dist/host-commit.txt
-            android/dist/host-sdk-config.patch
           if-no-files-found: error
 
   release:
@@ -225,4 +161,3 @@ jobs:
             dist/publisher-public.pem
             dist/publisher-info.txt
             dist/host-commit.txt
-            dist/host-sdk-config.patch

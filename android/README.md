@@ -42,18 +42,20 @@ android/
 D8 из Android build-tools и приватный P-256 ключ издателя.
 
 ```sh
-# 1. распаковать SDK рядом с проектом и указать его в native-plugin.json ("sdk")
+# Все команды — из корня отдельного репозитория unified-home.
+# 1. распаковать готовый SDK (в пакет плагина он не попадёт)
 unzip amalia-native-sdk.zip -d amalia-native-sdk
 
 # 2. проверить манифест, ABI и отсутствие лишнего в пакете
-python3 /path/to/amalia-3.0/tools/native_plugin.py validate --project android \
+python3 tools/native_plugin.py validate --project android \
   --sdk "$PWD/amalia-native-sdk"
 
 # 3. собрать тонкий JAR (никаких fat-jar: классы хоста поставляет хост)
-android/gradlew -p android jar
+android/gradlew -p android jar -PamaliaNativeSdk="$PWD/amalia-native-sdk"
 
 # 4. подписать и упаковать
-python3 /path/to/amalia-3.0/tools/native_plugin.py package --project android \
+python3 tools/native_plugin.py package --project android \
+  --sdk "$PWD/amalia-native-sdk" \
   --private-key ~/publisher-keys/unified-home.pem --key-id unified-home-1 \
   --d8 /path/to/android/build-tools/35.0.0/d8 \
   --output dist/org.amalia.unifiedhome-1.0.0.amaliaplug
@@ -65,10 +67,26 @@ python3 /path/to/amalia-3.0/tools/native_plugin.py package --project android \
 
 ## Сборка в GitHub Actions
 
-Workflow `.github/workflows/unified-home-plugin.yml` запускается только вручную
-и экспортирует SDK текущей сборки хоста, затем собирает и подписывает плагин.
-APK хоста не собирается. Настройте ключ в репозитории `amalia-3.0` по инструкции
-ниже; публичные файлы включаются в артефакт `unified-home-plugin`.
+Сборка живёт **в отдельном репозитории `unified-home`**, workflow
+`.github/workflows/build.yml`. Исходники хоста не скачиваются, Gradle хоста
+не запускается: используется уже готовый `amalia-native-sdk.zip`.
+
+1. Один раз получите успешный запуск *Native SDK distribution* для установленной
+   версии хоста в `azim224/amalia-3.0`.
+2. В репозитории плагина задайте variable `AMALIA_SDK_RUN_ID` — числовой ID этого
+   запуска; при ручном старте его можно переопределить через `sdk_run_id`.
+   Secret `AMALIA_TOKEN` должен иметь Actions read для репозитория хоста.
+   SDK привязан к выбранному запуску, автоматического перехода на latest нет.
+3. Задайте постоянный ключ издателя по инструкции ниже.
+4. Запускайте CI плагина: он скачивает SDK как **compileOnly**, собирает только
+   `android/`, проверяет JAR, делает D8 и подписывает `.amaliaplug` локальными
+   `tools/native_plugin.py` и `tools/PackagePlatformPlugin.py`.
+
+На выходе `unified-home-plugin`: `.amaliaplug`, публичный ключ, инструкция
+и commit хоста. SDK, JAR зависимостей, исходники хоста и APK в артефакт не входят.
+В `.amaliaplug` разрешены ровно `classes.dex`, `platform.json`, `package.sig`;
+CI отклоняет пакет больше 5 MiB и JAR с классами вне `org.amalia.unifiedhome`.
+SDK — отдельный инструмент компиляции, а не устанавливаемый плагин.
 
 ## Постоянный ключ издателя и установка CI-пакета
 
@@ -84,14 +102,14 @@ openssl ecparam -name prime256v1 -genkey -noout \
 
 Сохраните резервную копию приватного ключа. Не коммитьте его, не публикуйте
 и не прикладывайте к артефактам. В Settings → Secrets and variables → Actions
-репозитория, где запускается workflow, создайте secret
+отдельного репозитория `unified-home`, где запускается workflow, создайте secret
 `UNIFIED_HOME_SIGNING_KEY` с **полным PEM** этого приватного ключа. Используйте
 тот же ключ для следующих сборок, а не генерируйте новый при каждом запуске.
 В repository variables задайте постоянный `UNIFIED_HOME_KEY_ID`, например
 `unified-home-1` (это значение по умолчанию). `keyId` — точная строка,
 а не fingerprint; не меняйте её между обновлениями без явной ротации.
 При использовании обоих workflow настройте одинаковые ключ и ID в обоих
-репозиториях. Без secret CI останавливается до компиляции SDK; случайного
+репозиториях. Без secret CI останавливается до компиляции плагина; случайного
 резервного ключа нет. Проверяется, что ключ — EC P-256.
 
 В артефакте `unified-home-plugin` рядом с `.amaliaplug` находятся
