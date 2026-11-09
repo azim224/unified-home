@@ -25,6 +25,11 @@ val sdkRoot = file(providers.gradleProperty("amaliaNativeSdk").orNull ?: author[
 val sdk = JsonSlurper().parse(sdkRoot.resolve("sdk.json")) as Map<*, *>
 val classpath = ((sdk["classpath"] ?: sdk["compileOnlyClasspath"]) as List<*>)
     .map { sdkRoot.resolve(it.toString()) }
+// Older SDK exports stripped .kotlin_builtins from the normalized stdlib JAR.
+// Use the same official stdlib version for compilation only, never as D8 input.
+val stdlib = (sdk["dependencies"] as List<*>).map { it as Map<*, *> }
+    .single { it["component"].toString().startsWith("org.jetbrains.kotlin:kotlin-stdlib:") }
+val compileClasspath = classpath.filter { it != sdkRoot.resolve(stdlib["path"].toString()) }
 
 check(sdk["abi"] == author["abi"]) {
     "Native SDK ABI differs from native-plugin.json; export the SDK from the exact host build"
@@ -33,5 +38,6 @@ check(sdk["abi"] == author["abi"]) {
 dependencies {
     // compileOnly: the host supplies Kotlin, Compose, AndroidX, protocol and its own API.
     // Never ship a fat JAR — duplicate host classes are rejected by the packager.
-    compileOnly(files(classpath))
+    compileOnly(files(compileClasspath))
+    compileOnly(stdlib["component"].toString())
 }

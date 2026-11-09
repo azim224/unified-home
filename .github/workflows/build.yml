@@ -62,9 +62,17 @@ jobs:
           root = Path(os.environ['RUNNER_TEMP'])
           run = json.loads((root / 'sdk-run.json').read_text())
           if (run['path'] != '.github/workflows/native-sdk.yml'
-                  or run['status'] != 'completed' or run['conclusion'] != 'success'):
-              raise SystemExit('Select a successful Native SDK distribution run, not an APK/plugin run')
+                  or run['status'] != 'completed'):
+              raise SystemExit('Select a completed Native SDK distribution run, not an APK/plugin run')
           (root / 'host-commit.txt').write_text(run['head_sha'] + '\n')
+          PY
+          gh api "repos/azim224/amalia-3.0/actions/runs/$SDK_RUN_ID/jobs" > "$RUNNER_TEMP/sdk-jobs.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          jobs = json.loads((Path(os.environ['RUNNER_TEMP']) / 'sdk-jobs.json').read_text())['jobs']
+          if not any(j['name'] == 'export' and j['conclusion'] == 'success' for j in jobs):
+              raise SystemExit('The selected run must have a successful SDK export job')
           PY
           gh run download "$SDK_RUN_ID" --repo azim224/amalia-3.0 \
             --name amalia-native-sdk --dir "$RUNNER_TEMP/sdk-download"

@@ -71,7 +71,7 @@ python3 tools/native_plugin.py package --project android \
 `.github/workflows/build.yml`. Исходники хоста не скачиваются, Gradle хоста
 не запускается: используется уже готовый `amalia-native-sdk.zip`.
 
-1. Один раз получите успешный запуск *Native SDK distribution* для установленной
+1. Один раз получите запуск *Native SDK distribution* с успешным job `export` для установленной
    версии хоста в `azim224/amalia-3.0`.
 2. В репозитории плагина задайте variable `AMALIA_SDK_RUN_ID` — числовой ID этого
    запуска; при ручном старте его можно переопределить через `sdk_run_id`.
