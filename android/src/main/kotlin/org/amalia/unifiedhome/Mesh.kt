@@ -17,8 +17,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
@@ -28,7 +26,6 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
-import java.util.concurrent.ConcurrentHashMap
 
 /** Authenticated household member; host is a routing hint, never an identity. */
 data class MeshNode(
@@ -43,6 +40,8 @@ data class MeshNode(
     val session: String = "",
     val platform: String = "android",
     val services: List<String> = emptyList(),
+    val coordinationVersion: Int = 0,
+    val secureVersion: Int = 0,
 ) {
     fun online(now: Long = System.currentTimeMillis()): Boolean =
         self || now - lastSeenAt <= MeshService.NODE_TTL_MS
@@ -64,6 +63,7 @@ data class MeshConfig(
     val role: String = "hub",
     val priority: Int = 10,
     val port: Int = MeshService.DEFAULT_PORT,
+    val coordination: CoordinationPreferences = CoordinationPreferences(),
 )
 
 class MeshService(
@@ -85,6 +85,10 @@ class MeshService(
 
     private data class Pending(
         val peer: String, val peerSession: String, val operation: String,
+        val result: CompletableDeferred<JSONObject>,
+    )
+    private data class SecurePending(
+        val peer: String, val peerSession: String, val timeoutMs: Long,
         val result: CompletableDeferred<JSONObject>,
     )
     private data class RequestKey(val peer: String, val session: String, val request: String)
@@ -110,8 +114,17 @@ class MeshService(
     private val announcedSessions = HashMap<String, String>()
     private var inflight = 0
     private val inbound = mutableMapOf<Job, Pair<String, String>>()
-    private val voteMutex = Mutex()
-    private var activeRound: Pair<String, ConcurrentHashMap<String, Double>>? = null
+    val coordination = HomeCoordination(this)
+
+    /** Opt-in application dispatcher only: the transport never executes commands or code itself.
+     * Runs on bounded IO workers, outside the mesh monitor; must cooperate with cancellation.
+     * Return {ok: Boolean, data: JSONObject, error: String}. Exceptions/errors are sanitized.
+     */
+    @Volatile
+    var secureHandler: (suspend (operation: String, args: JSONObject, from: String, session: String) -> JSONObject)? = null
+    private val securePending = mutableMapOf<String, SecurePending>()
+    private val secureExecuted = HashSet<RequestKey>()
+    private val secureInbound = mutableMapOf<Job, Pair<String, String>>()
 
     private val _nodes = MutableStateFlow<List<MeshNode>>(emptyList())
     val nodes: StateFlow<List<MeshNode>> = _nodes.asStateFlow()
@@ -192,6 +205,19 @@ class MeshService(
         return config
     }
 
+    @Synchronized
+    fun updateCoordination(preferences: CoordinationPreferences): CoordinationPreferences {
+        ensureLoaded()
+        check(storageHealthy) { "Home storage unavailable" }
+        val validated = CoordinationPreferences.fromJson(preferences.toJson())
+        val next = config.copy(coordination = validated)
+        persist(next, credentials)
+        config = next
+        coordination.clear() // Routing changes invalidate pending decisions and coordinated plans.
+        publishPeers()
+        return preferences
+    }
+
     private fun ensureLoaded() {
         if (loaded) return
         loaded = true
@@ -224,7 +250,8 @@ class MeshService(
                     val member = json.getJSONObject("membership")
                     HomeLink.parseInvite("amalia-home:v2:${member.getString("home")}:${member.getString("key")}")
                 }
-                config = MeshConfig(id, name, role, priority, port)
+                config = MeshConfig(id, name, role, priority, port,
+                    json.optJSONObject("coordination")?.let { CoordinationPreferences.fromJson(it) } ?: CoordinationPreferences())
                 credentials = next
             }
             persist(config, credentials) // Also make a newly generated node id durable before networking.
@@ -240,6 +267,7 @@ class MeshService(
     private fun persist(settings: MeshConfig, member: HomeLink.Credentials?) {
         val json = JSONObject().put("id", settings.id).put("name", settings.name).put("role", settings.role)
             .put("priority", settings.priority).put("port", settings.port)
+            .put("coordination", settings.coordination.toJson())
         if (member == null) json.put("membership", JSONObject.NULL) else {
             val parts = HomeLink.invite(member).split(':')
             json.put("membership", JSONObject().put("home", member.home).put("key", parts[3]))
@@ -312,10 +340,15 @@ class MeshService(
         old?.close()
         pending.values.forEach { it.result.complete(failure("Request interrupted", "unknown")) }
         pending.clear()
+        securePending.values.forEach { it.result.complete(SecureHome.failure("Secure request interrupted; outcome unknown")) }
+        securePending.clear()
+        secureInbound.keys.toList().forEach { it.cancel() }
+        secureInbound.clear()
+        secureExecuted.clear()
         job?.cancel()
         inflight = 0
         inbound.clear()
-        activeRound = null
+        coordination.clear()
         replay.clear()
         executed.clear()
         retiredSessions.clear()
@@ -349,7 +382,8 @@ class MeshService(
                 if (socket !== udp) return
                 send(udp, JSONObject().put("t", "announce").put("name", config.name).put("role", config.role)
                     .put("priority", config.priority).put("port", config.port).put("platform", "android")
-                    .put("services", JSONArray(HomeLink.operations.toList())))
+                    .put("services", JSONArray(HomeLink.operations.toList()))
+                    .put("coordination_version", HomeCoordination.VERSION).put("secure_version", SecureHome.VERSION))
                 publishPeers()
             }
             delay(ANNOUNCE_INTERVAL_MS)
@@ -419,18 +453,17 @@ class MeshService(
             }
             announcedSessions[message.id] = message.session
             peers[message.id] = MeshNode(message.id, name, role, priority, host, port, now,
-                session = message.session, platform = platform, services = services)
+                session = message.session, platform = platform, services = services,
+                coordinationVersion = HomeLink.integer(body, "coordination_version")?.takeIf { it == HomeCoordination.VERSION } ?: 0,
+                secureVersion = HomeLink.integer(body, "secure_version")?.takeIf { it == SecureHome.VERSION } ?: 0)
             publishPeers()
             return null
         }
         val peer = peers[message.id]?.takeIf { it.online(now) && it.session == message.session } ?: return null
+        if (body.opt("t") == "secure_request" || body.opt("t") == "secure_result") {
+            return handleSecure(udp, message, peer)
+        }
         when (body.opt("t")) {
-            "vote" -> {
-                val round = body.opt("round") as? String ?: return null
-                val score = (body.opt("score") as? Number)?.toDouble() ?: return null
-                if (!HomeLink.validUuid(round) || !score.isFinite() || score !in 0.0..100.0) return null
-                activeRound?.takeIf { it.first == round }?.second?.putIfAbsent(peer.id, score)
-            }
             "request", "result" -> {
                 if (body.opt("to") != config.id || body.opt("to_session") != session) return null
                 val id = body.opt("request_id") as? String ?: return null
@@ -470,7 +503,11 @@ class MeshService(
                             if (!valid) return@launch
                             val result = try {
                                 withTimeoutOrNull(REQUEST_TIMEOUT_MS) {
-                                    normalize(onRequest(operation, args, peer.id, peer.session))
+                                    normalize(if (operation == "catalog" && args.has("coordination")) {
+                                        coordination.handle(args)
+                                    } else {
+                                        onRequest(operation, args, peer.id, peer.session)
+                                    })
                                 } ?: failure("Remote request timed out", "unknown")
                             } catch (cancelled: CancellationException) { throw cancelled }
                             catch (_: Exception) { failure("Remote request failed") }
@@ -492,6 +529,120 @@ class MeshService(
             }
         }
         return null
+    }
+
+    /** Under mesh monitor; never invokes the optional application handler here. */
+    private fun handleSecure(udp: DatagramSocket, message: HomeLink.Message, peer: MeshNode): Job? {
+        if (peer.secureVersion != SecureHome.VERSION) return null
+        val member = credentials ?: return null
+        val opened = SecureHome.open(member, message, config.id, session) ?: return null
+        val payload = opened.payload
+        if (message.body.opt("t") == "secure_result") {
+            val wait = securePending[opened.id] ?: return null
+            if (wait.peer != peer.id || wait.peerSession != peer.session || wait.timeoutMs != opened.timeoutMs) return null
+            if (payload.keys().asSequence().toSet() != setOf("ok", "data", "error") ||
+                payload.opt("ok") !is Boolean || payload.opt("data") !is JSONObject || payload.opt("error") !is String) return null
+            securePending.remove(opened.id)
+            wait.result.complete(payload)
+            return null
+        }
+        if (payload.keys().asSequence().toSet() != setOf("op", "args")) return null
+        val operation = payload.opt("op") as? String ?: return null
+        val args = payload.opt("args") as? JSONObject ?: return null
+        if (!HomeLink.validText(operation, 128)) return null
+        val key = RequestKey(peer.id, peer.session, opened.id)
+        if (key in secureExecuted) return null
+        if (secureExecuted.size >= MAX_HISTORY) {
+            sendSecureResult(udp, peer, opened.id, opened.timeoutMs, SecureHome.failure("Secure request history full; restart session"))
+            return null // Never evict old IDs to admit execution.
+        }
+        secureExecuted.add(key) // Also remember overload/unavailable decisions; never execute a retry.
+        if (secureInbound.size >= MAX_WORK) {
+            sendSecureResult(udp, peer, opened.id, opened.timeoutMs, SecureHome.failure("Secure node busy"))
+            return null
+        }
+        val handler = secureHandler
+        if (handler == null) {
+            sendSecureResult(udp, peer, opened.id, opened.timeoutMs, SecureHome.failure("Secure handler unavailable"))
+            return null
+        }
+        val childScope = workers ?: return null
+        val ourSession = session
+        val requestJob = childScope.launch(start = CoroutineStart.LAZY) {
+            val valid = synchronized(this@MeshService) {
+                socket === udp && session == ourSession && peers[peer.id]?.let {
+                    it.session == peer.session && it.online()
+                } == true
+            }
+            if (!valid) return@launch
+            val result = try {
+                withTimeoutOrNull(opened.timeoutMs) {
+                    val value = handler(operation, args, peer.id, peer.session)
+                    try { SecureHome.snapshot(normalize(value)) }
+                    catch (_: Exception) { SecureHome.failure("Secure result exceeds payload or JSON limits") }
+                } ?: SecureHome.failure("Secure handler timed out; outcome unknown")
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { SecureHome.failure("Secure handler failed") }
+            synchronized(this@MeshService) {
+                if (socket === udp && session == ourSession && peers[peer.id]?.session == peer.session) {
+                    if (!sendSecureResult(udp, peer, opened.id, opened.timeoutMs, result)) {
+                        sendSecureResult(udp, peer, opened.id, opened.timeoutMs, SecureHome.failure("Secure result could not be sent"))
+                    }
+                }
+            }
+        }
+        secureInbound[requestJob] = peer.id to peer.session
+        requestJob.invokeOnCompletion { synchronized(this@MeshService) { secureInbound.remove(requestJob) } }
+        return requestJob
+    }
+
+    private fun sendSecureResult(udp: DatagramSocket, peer: MeshNode, id: String, timeoutMs: Long, result: JSONObject): Boolean {
+        val member = credentials ?: return false
+        return try {
+            send(udp, SecureHome.seal(member, config.id, session, peer.id, peer.session,
+                id, "secure_result", timeoutMs, result), peer)
+        } catch (_: Exception) { false }
+    }
+
+    /** Single datagram, no retries. Timeout/cancellation after send means outcome is unknown.
+     * Complete plaintext JSON is capped at 8192 UTF-8 bytes; no truncation/fragmentation.
+     * Requires a fresh announcement with secure_version=1; never falls back to cleartext RPC.
+     */
+    suspend fun secureRequest(nodeId: String, operation: String, args: JSONObject = JSONObject(),
+        timeoutMs: Long = 12_000L): JSONObject = withContext(Dispatchers.IO) {
+        if (timeoutMs !in 1..SecureHome.MAX_TIMEOUT_MS) return@withContext SecureHome.failure("Invalid secure timeout (1..120000 ms)")
+        if (!HomeLink.validText(operation, 128)) return@withContext SecureHome.failure("Invalid secure operation")
+        val payload = try { SecureHome.snapshot(JSONObject().put("op", operation).put("args", args)) }
+            catch (_: Exception) { return@withContext SecureHome.failure("Secure request exceeds payload or JSON limits (8192 bytes)") }
+        val id = HomeLink.uuid()
+        val deferred = CompletableDeferred<JSONObject>()
+        val wait = synchronized(this@MeshService) {
+            ensureLoaded()
+            val udp = socket
+            val member = credentials
+            val peer = peers[nodeId]
+            if (udp == null || !running || member == null || peer == null || !peer.online()) {
+                return@withContext SecureHome.failure("Secure node unavailable")
+            }
+            if (peer.secureVersion != SecureHome.VERSION) return@withContext SecureHome.failure("Secure RPC unavailable")
+            if (securePending.size >= MAX_WORK) return@withContext SecureHome.failure("Too many pending secure requests")
+            val body = try { SecureHome.seal(member, config.id, session, peer.id, peer.session,
+                id, "secure_request", timeoutMs, payload) }
+                catch (_: Exception) { return@withContext SecureHome.failure("Secure request encryption failed") }
+            val value = SecurePending(peer.id, peer.session, timeoutMs, deferred)
+            securePending[id] = value
+            if (!send(udp, body, peer)) {
+                securePending.remove(id)
+                return@withContext SecureHome.failure("Secure request could not be sent; outcome unknown")
+            }
+            value
+        }
+        try {
+            withTimeoutOrNull(timeoutMs) { deferred.await() }
+                ?: SecureHome.failure("Secure request timed out; outcome unknown")
+        } finally {
+            synchronized(this@MeshService) { if (securePending[id] === wait) securePending.remove(id) }
+        }
     }
 
     private fun normalize(value: JSONObject): JSONObject {
@@ -543,6 +694,10 @@ class MeshService(
         }
 
     private fun failPending(peerId: String) {
+        val secureIds = securePending.filterValues { it.peer == peerId }.keys.toList()
+        secureIds.forEach { securePending.remove(it)?.result?.complete(
+            SecureHome.failure("Peer session changed or unavailable; outcome unknown")) }
+        secureInbound.filterValues { it.first == peerId }.keys.toList().forEach { it.cancel() }
         val ids = pending.filterValues { it.peer == peerId }.keys.toList()
         ids.forEach { pending.remove(it)?.result?.complete(failure("Peer session changed", "unknown")) }
     }
@@ -555,7 +710,8 @@ class MeshService(
     private fun publishPeers() {
         prunePeers()
         val self = MeshNode(config.id, config.name, config.role, config.priority, "—", config.port,
-            System.currentTimeMillis(), self = true, session = session, services = HomeLink.operations.toList())
+            System.currentTimeMillis(), self = true, session = session, services = HomeLink.operations.toList(),
+            coordinationVersion = HomeCoordination.VERSION, secureVersion = SecureHome.VERSION)
         _nodes.value = listOf(self) + peers.values.sortedByDescending { it.priority }
     }
 
@@ -571,40 +727,19 @@ class MeshService(
         }.getOrDefault(false)
     }
 
-    /** Diagnostic only; deliberately not connected to microphone/VAD or automatic execution. */
+    /** Diagnostic integration probe. One coordinator obtains fresh peer samples for a shared round. */
+    @Suppress("UNUSED_PARAMETER")
     suspend fun vote(score: Double, windowMs: Long = VOTE_WINDOW_MS): VoteResult = withContext(Dispatchers.IO) {
-        require(score.isFinite() && score in 0.0..100.0) { "Score must be finite and in 0..100" }
-        require(windowMs in 0L..5_000L) { "Vote window must be in 0..5000 ms" }
-        voteMutex.withLock {
-            val votes = ConcurrentHashMap<String, Double>()
-            val round = HomeLink.uuid() to votes
-            val snapshot = settings
-            votes[snapshot.id] = score
-            var sent = false
-            val startedSession: String
-            val udp: DatagramSocket?
-            synchronized(this@MeshService) {
-                startedSession = session
-                udp = socket
-                if (udp != null && running) {
-                    activeRound = round
-                    sent = send(udp, JSONObject().put("t", "vote").put("round", round.first).put("score", score))
-                }
-            }
-            try { if (sent) delay(windowMs) }
-            finally { synchronized(this@MeshService) { if (activeRound === round) activeRound = null } }
-            synchronized(this@MeshService) {
-                val localOnly = !sent || socket !== udp || startedSession != session || !running
-                if (localOnly) { votes.clear(); votes[snapshot.id] = score }
-                val candidates = votes.entries.filter { it.key == snapshot.id || peers[it.key]?.online() == true }
-                val winner = candidates.maxWithOrNull(compareBy<Map.Entry<String, Double>> { it.value }
-                    .thenBy { peers[it.key]?.priority ?: snapshot.priority }.thenBy { it.key })!!
-                val result = VoteResult(winner.key, if (winner.key == snapshot.id) snapshot.name else peers[winner.key]?.name ?: winner.key,
-                    winner.value, candidates.size, winner.key == snapshot.id, localOnly)
-                if (startedSession == session) _lastVote.value = result
-                result
-            }
-        }
+        require(windowMs in 0L..5_000L)
+        coordination.publishProximity(score)
+        val response = coordination.arbitrate(HomeLink.uuid())
+        val data = response.optJSONObject("data")
+        val winner = (data?.optJSONObject("routing")?.opt("responder") as? String).orEmpty()
+        val node = nodes.value.firstOrNull { it.id == winner }
+        val result = VoteResult(winner, node?.name.orEmpty(), if (winner == nodeId) score else 0.0,
+            data?.optInt("participants", 0) ?: 0, winner == nodeId, !running)
+        _lastVote.value = result
+        result
     }
 
     @Deprecated("Use explicit plan_scene/apply_plan RPC with human agreement")

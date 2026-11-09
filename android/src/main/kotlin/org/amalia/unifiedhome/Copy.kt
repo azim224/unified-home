@@ -481,3 +481,332 @@ private val LOCALES: Map<String, Copy> = mapOf(
 /** Тексты для языка интерфейса; неизвестный — английский. */
 fun copyFor(languageTag: String): Copy =
     LOCALES[languageTag.trim().lowercase(Locale.ROOT).substringBefore('-')] ?: EN
+
+/** Coordination metadata only; these controls do not enable a remote voice pipeline. */
+data class CoordinationCopy(
+    val title: String,
+    val mode: String,
+    val automatic: String,
+    val manual: String,
+    val brain: String,
+    val listener: String,
+    val executor: String,
+    val responder: String,
+    val hint: String,
+    val pipelineNotice: String,
+    val unavailable: String,
+    val incompatible: String,
+    val failed: String,
+    val saved: String,
+) {
+    fun roleLabel(role: String): String = when (role) {
+        "brain" -> brain
+        "listener" -> listener
+        "executor" -> executor
+        "responder" -> responder
+        else -> role
+    }
+}
+
+private val COORDINATION_COPY = mapOf(
+    "en" to CoordinationCopy(
+        title = "Coordination", mode = "Selection mode", automatic = "Automatic", manual = "Manual",
+        brain = "Brain", listener = "Listener", executor = "Executor", responder = "Responder",
+        hint = "Node choices are retained in automatic mode and used only in manual mode. An automatic role remains automatic. These are this node’s preferences; the coordinator (lowest node ID) decides routing.",
+        pipelineNotice = "Android devices work together without a PC. Delegated processing, context and speech require local consent on the receiving device and an encrypted connection.",
+        unavailable = "Selected node is offline or missing. The choice is retained; it will not silently fall back to another node.",
+        incompatible = "Coordination is not supported by this node",
+        failed = "Could not read or save coordination preferences. Your edits are retained. Try again.",
+        saved = "Coordination preferences saved",
+    ),
+    "ru" to CoordinationCopy(
+        title = "Координация", mode = "Режим выбора", automatic = "Автоматически", manual = "Вручную",
+        brain = "Мозг", listener = "Слушатель", executor = "Исполнитель", responder = "Отвечающий",
+        hint = "Выбор узлов сохраняется в автоматическом режиме и применяется только в ручном. Автоматическая роль остаётся автоматической. Это предпочтения этого узла; маршрутизацию определяет координатор с наименьшим ID.",
+        pipelineNotice = "Android-устройства работают вместе без ПК. Обработка запросов, обмен контекстом и озвучивание требуют разрешения на принимающем устройстве и зашифрованного соединения.",
+        unavailable = "Выбранный узел не в сети или не найден. Выбор сохранён; скрытой подмены другим узлом не будет.",
+        incompatible = "Этот узел не поддерживает координацию",
+        failed = "Не удалось прочитать или сохранить настройки координации. Изменения не потеряны. Повтори попытку.",
+        saved = "Настройки координации сохранены",
+    ),
+    "de" to CoordinationCopy(
+        title = "Koordination", mode = "Auswahlmodus", automatic = "Automatisch", manual = "Manuell",
+        brain = "Denkmodul", listener = "Zuhörer", executor = "Ausführer", responder = "Antwortgeber",
+        hint = "Die Knotenauswahl bleibt im Automatikmodus erhalten und gilt nur im manuellen Modus. Automatische Rollen bleiben automatisch. Dies sind die Einstellungen dieses Knotens; der Koordinator mit der kleinsten Knoten-ID entscheidet über die Zuordnung.",
+        pipelineNotice = "Android-Geräte arbeiten ohne PC zusammen. Verarbeitung, Kontext und Sprache benötigen die lokale Zustimmung des empfangenden Geräts und eine verschlüsselte Verbindung.",
+        unavailable = "Der gewählte Knoten ist offline oder fehlt. Die Auswahl bleibt erhalten; es wird nicht still auf einen anderen Knoten gewechselt.",
+        incompatible = "Dieser Knoten unterstützt keine Koordination",
+        failed = "Koordinationseinstellungen konnten nicht gelesen oder gespeichert werden. Deine Änderungen bleiben erhalten. Erneut versuchen.",
+        saved = "Koordinationseinstellungen gespeichert",
+    ),
+    "es" to CoordinationCopy(
+        title = "Coordinación", mode = "Modo de selección", automatic = "Automático", manual = "Manual",
+        brain = "Cerebro", listener = "Oyente", executor = "Ejecutor", responder = "Interlocutor",
+        hint = "La selección de nodos se conserva en modo automático y solo se aplica en modo manual. Los roles automáticos siguen siendo automáticos. Estas son las preferencias de este nodo; el coordinador con el ID menor decide las rutas.",
+        pipelineNotice = "Los dispositivos Android cooperan sin PC. El procesamiento, contexto y voz requieren permiso local en el receptor y conexión cifrada.",
+        unavailable = "El nodo seleccionado está desconectado o no se encuentra. La selección se conserva; no se sustituirá por otro nodo sin avisar.",
+        incompatible = "Este nodo no admite coordinación",
+        failed = "No se pudieron leer o guardar las preferencias de coordinación. Se conservan tus cambios. Inténtalo de nuevo.",
+        saved = "Preferencias de coordinación guardadas",
+    ),
+    "fr" to CoordinationCopy(
+        title = "Coordination", mode = "Mode de sélection", automatic = "Automatique", manual = "Manuel",
+        brain = "Cerveau", listener = "Écoute", executor = "Exécution", responder = "Réponse",
+        hint = "Les choix de nœuds sont conservés en mode automatique et utilisés uniquement en mode manuel. Un rôle automatique reste automatique. Ces préférences concernent ce nœud ; le coordinateur au plus petit identifiant décide du routage.",
+        pipelineNotice = "Les appareils Android coopèrent sans PC. Le traitement, le contexte et la voix nécessitent un accord local sur le destinataire et une connexion chiffrée.",
+        unavailable = "Le nœud choisi est hors ligne ou introuvable. Le choix est conservé ; aucun autre nœud ne le remplacera silencieusement.",
+        incompatible = "Ce nœud ne prend pas en charge la coordination",
+        failed = "Impossible de lire ou d’enregistrer les préférences de coordination. Vos modifications sont conservées. Réessayez.",
+        saved = "Préférences de coordination enregistrées",
+    ),
+    "ja" to CoordinationCopy(
+        title = "連携", mode = "選択モード", automatic = "自動", manual = "手動",
+        brain = "思考役", listener = "聞き取り役", executor = "実行役", responder = "応答役",
+        hint = "自動モードでもノードの選択は保持され、手動モードでのみ使用されます。自動に設定した役割は自動のままです。これはこのノードの設定です。最小のIDを持つコーディネーターが経路を決定します。",
+        pipelineNotice = "Android端末同士でPCなしに連携します。処理・コンテキスト共有・音声には受信端末での許可と暗号化接続が必要です。",
+        unavailable = "選択したノードはオフラインか見つかりません。選択は保持され、別のノードに無断で切り替わることはありません。",
+        incompatible = "このノードは連携に対応していません",
+        failed = "連携設定を読み込みまたは保存できませんでした。編集内容は保持されています。再試行してください。",
+        saved = "連携設定を保存しました",
+    ),
+    "zh" to CoordinationCopy(
+        title = "协调", mode = "选择模式", automatic = "自动", manual = "手动",
+        brain = "思考节点", listener = "聆听节点", executor = "执行节点", responder = "应答节点",
+        hint = "自动模式下会保留节点选择，但仅在手动模式下使用。设为自动的角色仍会自动选择。这是当前节点的偏好；由节点 ID 最小的协调器决定路由。",
+        pipelineNotice = "Android 设备无需电脑即可协作。处理请求、共享上下文和播放语音需要接收设备本地授权和加密连接。",
+        unavailable = "所选节点已离线或未找到。选择会保留，不会静默切换到其他节点。",
+        incompatible = "此节点不支持协调",
+        failed = "无法读取或保存协调偏好。编辑内容已保留，请重试。",
+        saved = "协调偏好已保存",
+    ),
+    "hi" to CoordinationCopy(
+        title = "समन्वय", mode = "चयन मोड", automatic = "स्वचालित", manual = "मैन्युअल",
+        brain = "विचारक", listener = "श्रोता", executor = "निष्पादक", responder = "उत्तरदाता",
+        hint = "स्वचालित मोड में नोड चयन सुरक्षित रहता है और केवल मैन्युअल मोड में लागू होता है। स्वचालित भूमिका स्वचालित ही रहती है। ये इस नोड की प्राथमिकताएँ हैं; सबसे छोटी नोड ID वाला समन्वयक रूटिंग तय करता है।",
+        pipelineNotice = "Android उपकरण बिना पीसी साथ काम करते हैं। अनुरोध, संदर्भ और आवाज़ के लिए प्राप्तकर्ता की स्थानीय अनुमति और एन्क्रिप्टेड कनेक्शन आवश्यक हैं।",
+        unavailable = "चुना गया नोड ऑफ़लाइन है या नहीं मिला। चयन सुरक्षित है; बिना बताए दूसरे नोड का उपयोग नहीं होगा।",
+        incompatible = "यह नोड समन्वय का समर्थन नहीं करता",
+        failed = "समन्वय प्राथमिकताएँ पढ़ी या सहेजी नहीं जा सकीं। आपके बदलाव सुरक्षित हैं। फिर कोशिश करें।",
+        saved = "समन्वय प्राथमिकताएँ सहेजी गईं",
+    ),
+    "ar" to CoordinationCopy(
+        title = "التنسيق", mode = "وضع الاختيار", automatic = "تلقائي", manual = "يدوي",
+        brain = "التفكير", listener = "الاستماع", executor = "التنفيذ", responder = "الاستجابة",
+        hint = "تُحفظ اختيارات العقد في الوضع التلقائي وتُستخدم في الوضع اليدوي فقط. يظل الدور التلقائي تلقائيًا. هذه تفضيلات هذه العقدة؛ والمنسق ذو أصغر معرّف عقدة يقرر التوجيه.",
+        pipelineNotice = "تتعاون أجهزة Android دون حاسوب. تتطلب معالجة الطلبات والسياق والصوت موافقة محلية على الجهاز المستقبِل واتصالاً مشفراً.",
+        unavailable = "العقدة المختارة غير متصلة أو غير موجودة. يُحفظ الاختيار ولن تُستبدل بعقدة أخرى بصمت.",
+        incompatible = "هذه العقدة لا تدعم التنسيق",
+        failed = "تعذرت قراءة تفضيلات التنسيق أو حفظها. تعديلاتك محفوظة. حاول مجددًا.",
+        saved = "تم حفظ تفضيلات التنسيق",
+    ),
+)
+
+fun coordinationCopyFor(languageTag: String): CoordinationCopy =
+    COORDINATION_COPY[languageTag.trim().lowercase(Locale.ROOT).substringBefore('-')]
+        ?: COORDINATION_COPY.getValue("en")
+
+/** Private sharing consent is independent of coordination role preferences. */
+data class SharingCopy(
+    val title: String,
+    val hint: String,
+    val context: String,
+    val contextHint: String,
+    val brain: String,
+    val brainHint: String,
+    val speaker: String,
+    val speakerHint: String,
+    val listener: String,
+    val listenerHint: String,
+    val limits: String,
+    val saving: String,
+    val failed: String,
+)
+
+private val SHARING_COPY = mapOf(
+    "ru" to SharingCopy(
+        title = "Личный доступ",
+        hint = "Разрешения только для доверенных участников дома. Всё выключено по умолчанию; включай здесь вручную. Компьютер не нужен.",
+        context = "Делиться контекстом",
+        contextHint = "Разрешить запрашивать ограниченный контекст этого устройства.",
+        brain = "Обрабатывать запросы",
+        brainHint = "Разрешить обработку переданного текста через LLM и инструменты этого устройства.",
+        speaker = "Озвучивать текст",
+        speakerHint = "Разрешить озвучивание переданного текста на этом устройстве.",
+        listener = "Включать микрофон по запросу дома",
+        listenerHint = "Разрешить доверенным участникам дома включать микрофон этого устройства для голосового запроса, даже если оно не услышало слово активации. Нужны разрешение Android на микрофон и включённая голосовая активация.",
+        limits = "Это не даёт доступа к произвольным файлам или камере и не меняет разрешения Android. Выбор роли и команды ассистенту не включают доступ.",
+        saving = "Сохраняю разрешение…",
+        failed = "Не удалось сохранить разрешение. Изменение не применено; повтори попытку или оставь прежние настройки.",
+    ),
+    "en" to SharingCopy(
+        title = "Private sharing",
+        hint = "For trusted household peers only. Everything is off by default; enable it manually here. No PC required.",
+        context = "Share context",
+        contextHint = "Allow requests for bounded context from this device.",
+        brain = "Process requests",
+        brainHint = "Allow delegated text to be processed through this device’s LLM and tools.",
+        speaker = "Speak text",
+        speakerHint = "Allow delegated text to be spoken on this device.",
+        listener = "Allow household microphone activation",
+        listenerHint = "Allow trusted household peers to activate this device’s microphone for a voice request, even if it did not hear the wake word. Requires Android microphone permission and wake-word activation enabled.",
+        limits = "This does not grant arbitrary file or camera access or change Android permissions. Choosing a role or asking the assistant never enables sharing.",
+        saving = "Saving consent…",
+        failed = "Could not save consent. The change was not applied; retry or keep the previous settings.",
+    ),
+    "ja" to SharingCopy(
+        title = "プライベート共有",
+        hint = "信頼できるホームの参加端末専用です。初期状態はすべてオフ。ここで手動で許可します。PCは不要です。",
+        context = "コンテキストを共有",
+        contextHint = "この端末の限定的なコンテキストの要求を許可します。",
+        brain = "リクエストを処理",
+        brainHint = "委任されたテキストをこの端末のLLMとツールで処理することを許可します。",
+        speaker = "テキストを読み上げ",
+        speakerHint = "委任されたテキストをこの端末で読み上げることを許可します。",
+        listener = "ホームからのマイク起動を許可",
+        listenerHint = "信頼できるホームの参加端末が、ウェイクワードを聞き取れなかった場合も、この端末のマイクを起動して音声リクエストを受け付けることを許可します。Androidのマイク権限とウェイクワード起動の有効化が必要です。",
+        limits = "任意のファイルやカメラへのアクセスは許可されず、Androidの権限も変わりません。役割の選択やアシスタントへの指示で共有が有効になることはありません。",
+        saving = "許可を保存中…",
+        failed = "許可を保存できませんでした。変更は適用されていません。再試行するか、以前の設定を維持してください。",
+    ),
+    "de" to SharingCopy(
+        title = "Private Freigaben",
+        hint = "Nur für vertrauenswürdige Teilnehmer des Zuhauses. Standardmäßig ist alles aus; hier manuell einschalten. Kein PC nötig.",
+        context = "Kontext teilen",
+        contextHint = "Anfragen nach begrenztem Kontext dieses Geräts erlauben.",
+        brain = "Anfragen verarbeiten",
+        brainHint = "Übergebenen Text mit dem LLM und den Werkzeugen dieses Geräts verarbeiten lassen.",
+        speaker = "Text vorlesen",
+        speakerHint = "Übergebenen Text auf diesem Gerät vorlesen lassen.",
+        listener = "Mikrofonaktivierung durch das Zuhause erlauben",
+        listenerHint = "Vertrauenswürdige Teilnehmer des Zuhauses dürfen das Mikrofon dieses Geräts für eine Sprachanfrage aktivieren, auch wenn es das Aktivierungswort nicht gehört hat. Android-Mikrofonberechtigung und aktivierte Sprachaktivierung sind erforderlich.",
+        limits = "Kein beliebiger Datei- oder Kamerazugriff; Android-Berechtigungen bleiben unverändert. Rollenwahl und Assistentenbefehle aktivieren keine Freigaben.",
+        saving = "Freigabe wird gespeichert…",
+        failed = "Freigabe konnte nicht gespeichert werden. Änderung nicht angewendet; erneut versuchen oder bisherige Einstellungen beibehalten.",
+    ),
+    "es" to SharingCopy(
+        title = "Uso compartido privado",
+        hint = "Solo para miembros de confianza del hogar. Todo está desactivado por defecto; actívalo aquí manualmente. No requiere PC.",
+        context = "Compartir contexto",
+        contextHint = "Permitir solicitudes de contexto limitado de este dispositivo.",
+        brain = "Procesar solicitudes",
+        brainHint = "Permitir procesar texto delegado con el LLM y las herramientas de este dispositivo.",
+        speaker = "Leer texto en voz alta",
+        speakerHint = "Permitir que este dispositivo lea el texto delegado.",
+        listener = "Permitir que el hogar active el micrófono",
+        listenerHint = "Permitir que los miembros de confianza del hogar activen el micrófono de este dispositivo para una solicitud de voz, aunque no haya oído la palabra de activación. Requiere permiso de micrófono de Android y activación por voz habilitada.",
+        limits = "No concede acceso arbitrario a archivos ni a la cámara, ni cambia los permisos de Android. Elegir un rol o pedirlo al asistente no activa el acceso.",
+        saving = "Guardando permiso…",
+        failed = "No se pudo guardar el permiso. El cambio no se aplicó; reintenta o conserva los ajustes anteriores.",
+    ),
+    "fr" to SharingCopy(
+        title = "Partage privé",
+        hint = "Uniquement pour les membres de confiance du foyer. Tout est désactivé par défaut ; activez ici manuellement. Aucun PC requis.",
+        context = "Partager le contexte",
+        contextHint = "Autoriser les demandes de contexte limité de cet appareil.",
+        brain = "Traiter les demandes",
+        brainHint = "Autoriser le traitement du texte délégué par le LLM et les outils de cet appareil.",
+        speaker = "Lire le texte à voix haute",
+        speakerHint = "Autoriser la lecture du texte délégué sur cet appareil.",
+        listener = "Autoriser le foyer à activer le microphone",
+        listenerHint = "Autoriser les membres de confiance du foyer à activer le microphone de cet appareil pour une demande vocale, même sans détection du mot d’activation. Nécessite l’autorisation microphone Android et l’activation vocale activée.",
+        limits = "Aucun accès arbitraire aux fichiers ou à la caméra ; les autorisations Android restent inchangées. Le choix d’un rôle ou une demande à l’assistant n’active pas le partage.",
+        saving = "Enregistrement du consentement…",
+        failed = "Impossible d’enregistrer le consentement. Modification non appliquée ; réessayez ou conservez les réglages précédents.",
+    ),
+    "zh" to SharingCopy(
+        title = "私密共享",
+        hint = "仅限受信任的家庭成员设备。默认全部关闭，请在此手动启用。无需电脑。",
+        context = "共享上下文",
+        contextHint = "允许请求此设备的有限上下文。",
+        brain = "处理请求",
+        brainHint = "允许通过此设备的LLM和工具处理委托文本。",
+        speaker = "朗读文本",
+        speakerHint = "允许在此设备上朗读委托文本。",
+        listener = "允许家庭成员激活麦克风",
+        listenerHint = "允许受信任的家庭成员设备激活此设备的麦克风以接收语音请求，即使此设备未听到唤醒词。需要 Android 麦克风权限并开启唤醒词激活。",
+        limits = "不会授予任意文件或相机访问权限，也不会更改Android权限。选择角色或向助手发出指令不会启用共享。",
+        saving = "正在保存授权…",
+        failed = "无法保存授权。更改未应用，请重试或保留原设置。",
+    ),
+    "hi" to SharingCopy(
+        title = "निजी साझाकरण",
+        hint = "केवल घर के भरोसेमंद सदस्यों के लिए। सब कुछ डिफ़ॉल्ट रूप से बंद है; यहीं मैन्युअल रूप से चालू करें। PC की ज़रूरत नहीं।",
+        context = "संदर्भ साझा करें",
+        contextHint = "इस डिवाइस से सीमित संदर्भ माँगने की अनुमति दें।",
+        brain = "अनुरोध संसाधित करें",
+        brainHint = "सौंपे गए टेक्स्ट को इस डिवाइस के LLM और टूल से संसाधित करने की अनुमति दें।",
+        speaker = "टेक्स्ट बोलें",
+        speakerHint = "इस डिवाइस पर सौंपा गया टेक्स्ट बोलने की अनुमति दें।",
+        listener = "घर से माइक्रोफ़ोन सक्रिय करने की अनुमति दें",
+        listenerHint = "घर के भरोसेमंद सदस्यों को आवाज़ का अनुरोध सुनने के लिए इस डिवाइस का माइक्रोफ़ोन सक्रिय करने दें, भले ही इसे वेक वर्ड सुनाई न दिया हो। Android माइक्रोफ़ोन अनुमति और वेक वर्ड सक्रियण चालू होना ज़रूरी है।",
+        limits = "इससे मनमानी फ़ाइलों या कैमरे तक पहुँच नहीं मिलती और Android अनुमतियाँ नहीं बदलतीं। भूमिका चुनने या सहायक को आदेश देने से साझाकरण चालू नहीं होता।",
+        saving = "सहमति सहेज रहे हैं…",
+        failed = "सहमति सहेजी नहीं जा सकी। बदलाव लागू नहीं हुआ; फिर कोशिश करें या पिछली सेटिंग रखें।",
+    ),
+    "ar" to SharingCopy(
+        title = "المشاركة الخاصة",
+        hint = "لأجهزة أعضاء المنزل الموثوقين فقط. كل الخيارات معطلة افتراضيًا؛ فعّلها يدويًا هنا. لا حاجة إلى كمبيوتر.",
+        context = "مشاركة السياق",
+        contextHint = "السماح بطلب سياق محدود من هذا الجهاز.",
+        brain = "معالجة الطلبات",
+        brainHint = "السماح بمعالجة النص المفوّض عبر النموذج اللغوي وأدوات هذا الجهاز.",
+        speaker = "نطق النص",
+        speakerHint = "السماح بنطق النص المفوّض على هذا الجهاز.",
+        listener = "السماح للمنزل بتفعيل الميكروفون",
+        listenerHint = "السماح لأجهزة أعضاء المنزل الموثوقين بتفعيل ميكروفون هذا الجهاز لطلب صوتي، حتى إن لم يسمع كلمة التنبيه. يتطلب إذن الميكروفون في Android وتفعيل التنبيه الصوتي.",
+        limits = "لا يمنح ذلك وصولًا عشوائيًا إلى الملفات أو الكاميرا ولا يغيّر أذونات Android. اختيار دور أو طلب من المساعد لا يفعّل المشاركة.",
+        saving = "جارٍ حفظ الموافقة…",
+        failed = "تعذر حفظ الموافقة. لم يُطبّق التغيير؛ أعد المحاولة أو احتفظ بالإعدادات السابقة.",
+    ),
+)
+
+fun sharingCopyFor(languageTag: String): SharingCopy =
+    SHARING_COPY[languageTag.trim().lowercase(Locale.ROOT).substringBefore('-').substringBefore('_')]
+        ?: SHARING_COPY.getValue("en")
+
+
+/** Foreground notification describes household data transport, not microphone availability. */
+data class BackgroundCopy(val title: String, val text: String)
+
+private val BACKGROUND_COPY = mapOf(
+    "ru" to BackgroundCopy(
+        "Единый дом",
+        "Поддерживаем связь с устройствами дома без ПК, пока приложение в фоне. Микрофон зависит от разрешений и ограничений Android.",
+    ),
+    "en" to BackgroundCopy(
+        "Unified home",
+        "Keeping household devices connected without a PC while the app is in the background. Microphone access depends on Android permissions and restrictions.",
+    ),
+    "ja" to BackgroundCopy(
+        "ひとつのホーム",
+        "アプリがバックグラウンドでも、PCなしでホームのデバイスとの接続を維持します。マイクの利用はAndroidの権限と制限に依存します。",
+    ),
+    "de" to BackgroundCopy(
+        "Gemeinsames Zuhause",
+        "Hält im Hintergrund ohne PC die Verbindung zu Geräten im Zuhause. Der Mikrofonzugriff hängt von Android-Berechtigungen und -Beschränkungen ab.",
+    ),
+    "es" to BackgroundCopy(
+        "Hogar unificado",
+        "Mantenemos la conexión con los dispositivos del hogar sin PC en segundo plano. El micrófono depende de los permisos y las restricciones de Android.",
+    ),
+    "fr" to BackgroundCopy(
+        "Maison unifiée",
+        "Maintient la connexion aux appareils du foyer sans PC en arrière-plan. Le microphone dépend des autorisations et des restrictions Android.",
+    ),
+    "zh" to BackgroundCopy(
+        "统一家庭",
+        "应用在后台时，无需电脑即可保持与家庭设备的连接。麦克风使用受Android权限和系统限制约束。",
+    ),
+    "hi" to BackgroundCopy(
+        "एकीकृत घर",
+        "ऐप बैकग्राउंड में होने पर भी PC के बिना घर के डिवाइसों से कनेक्शन बनाए रखते हैं। माइक्रोफ़ोन Android की अनुमतियों और पाबंदियों पर निर्भर है।",
+    ),
+    "ar" to BackgroundCopy(
+        "المنزل الموحّد",
+        "نحافظ على الاتصال بأجهزة المنزل دون كمبيوتر أثناء عمل التطبيق في الخلفية. يعتمد الميكروفون على أذونات Android وقيوده.",
+    ),
+)
+
+fun backgroundCopyFor(languageTag: String): BackgroundCopy =
+    BACKGROUND_COPY[languageTag.trim().lowercase(Locale.ROOT).substringBefore('-').substringBefore('_')]
+        ?: BACKGROUND_COPY.getValue("en")

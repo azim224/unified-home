@@ -39,6 +39,7 @@ class HomeEngine(context: Context, private val scope: CoroutineScope) {
 
     private val operations = Mutex()
     val store = HomeStore(context)
+    val sharing = HomeSharing(context)
     val plans = PlanStore()
     private data class RemoteOwner(val node: String, val session: String, val home: String, val receiver: String, val expires: Long)
     private val remotePlans = ConcurrentHashMap<String, RemoteOwner>()

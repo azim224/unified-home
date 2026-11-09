@@ -7,6 +7,10 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -18,6 +22,7 @@ import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material.icons.rounded.WifiOff
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Composable
@@ -26,7 +31,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -47,9 +56,11 @@ import com.my.amali.ui.components.GlassCard
 import com.my.amali.ui.components.GlassDialog
 import com.my.amali.ui.components.GlassDialogShell
 import com.my.amali.ui.components.GlassGroup
+import com.my.amali.ui.components.GlassDivider
 import com.my.amali.ui.components.GlassSlider
 import com.my.amali.ui.components.GhostButton
 import com.my.amali.ui.components.LoadingState
+import com.my.amali.ui.components.SkeletonList
 import com.my.amali.ui.components.PrimaryButton
 import com.my.amali.ui.components.SectionTitle
 import com.my.amali.ui.components.SettingsActionRow
@@ -81,6 +92,7 @@ import org.json.JSONObject
 fun HomeScreen(engine: HomeEngine, host: ScreenHost) {
     val language = LocalConfiguration.current.locales[0].language
     val copy = remember(language) { copyFor(language) }
+    val coordinationCopy = remember(language) { coordinationCopyFor(language) }
 
     val snapshot by engine.store.state.collectAsStateWithLifecycle()
     val nodes by engine.mesh.nodes.collectAsStateWithLifecycle()
@@ -280,6 +292,14 @@ fun HomeScreen(engine: HomeEngine, host: ScreenHost) {
                         vote = vote,
                         onVote = { scope.launch { engine.mesh.vote(50.0) } },
                     )
+                }
+
+                item(key = "private-sharing", contentType = "settings") {
+                    SharingSection(engine.sharing, sharingCopyFor(language), copy)
+                }
+
+                item(key = "coordination", contentType = "coordination") {
+                    CoordinationSection(engine, nodes, copy, coordinationCopy)
                 }
 
                 item(key = "add") {
@@ -572,6 +592,83 @@ private fun RoomGroup(
     }
 }
 
+// ── Local-only private sharing consent ───────────────────────────────────────
+
+@Composable
+private fun SharingSection(sharing: HomeSharing, copy: SharingCopy, common: Copy) {
+    val state by sharing.state.collectAsStateWithLifecycle()
+    val scope = rememberCoroutineScope()
+    var saving by remember(sharing) { mutableStateOf(false) }
+    var failed by remember(sharing) { mutableStateOf(false) }
+    var pending by remember(sharing) { mutableStateOf<Pair<String, Boolean>?>(null) }
+
+    fun save(key: String, enabled: Boolean) {
+        if (saving) return
+        saving = true
+        failed = false
+        pending = key to enabled
+        // This callback is only reachable through local settings controls, never a tool.
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) { sharing.update(JSONObject().put(key, enabled)) }
+                pending = null
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                failed = true
+            } finally {
+                saving = false
+            }
+        }
+    }
+
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+        SectionTitle(copy.title)
+        Text(copy.hint, style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        GlassGroup {
+            SettingsToggleRow(
+                title = copy.context, subtitle = copy.contextHint, checked = state.shareContext,
+                enabled = !saving, modifier = Modifier.heightIn(min = 48.dp),
+                onCheckedChange = { save("shareContext", it) },
+            )
+            GlassDivider()
+            SettingsToggleRow(
+                title = copy.brain, subtitle = copy.brainHint, checked = state.allowBrain,
+                enabled = !saving, modifier = Modifier.heightIn(min = 48.dp),
+                onCheckedChange = { save("allowBrain", it) },
+            )
+            GlassDivider()
+            SettingsToggleRow(
+                title = copy.speaker, subtitle = copy.speakerHint, checked = state.allowSpeaker,
+                enabled = !saving, modifier = Modifier.heightIn(min = 48.dp),
+                onCheckedChange = { save("allowSpeaker", it) },
+            )
+            GlassDivider()
+            SettingsToggleRow(
+                title = copy.listener, subtitle = copy.listenerHint, checked = state.allowListener,
+                enabled = !saving, modifier = Modifier.heightIn(min = 48.dp),
+                onCheckedChange = { save("allowListener", it) },
+            )
+        }
+        Text(copy.limits, style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (saving || failed) {
+            Text(
+                text = if (saving) copy.saving else copy.failed,
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+            )
+        }
+        if (failed && !saving) {
+            GhostButton(common.retry, onClick = {
+                pending?.let { (key, enabled) -> save(key, enabled) }
+            })
+        }
+    }
+}
+
 // ── Сеть ────────────────────────────────────────────────────────────────────
 
 @Composable
@@ -811,6 +908,279 @@ private fun NetworkSection(
             onConfirm = { perform { engine.mesh.leaveHome(); null } },
             onDismiss = { if (!updating) confirmLeave = false },
         )
+    }
+}
+
+// ── Coordination preferences (metadata, not remote voice activation) ─────────
+
+@Composable
+private fun CoordinationSection(
+    engine: HomeEngine,
+    nodes: List<MeshNode>,
+    copy: Copy,
+    text: CoordinationCopy,
+) {
+    val scope = rememberCoroutineScope()
+    var open by rememberSaveable(engine) { mutableStateOf(false) }
+    // JSON is saveable across recreation. Never key a draft to node announcements or refreshes.
+    var draftJson by rememberSaveable(engine) { mutableStateOf<String?>(null) }
+    var baselineJson by rememberSaveable(engine) { mutableStateOf<String?>(null) }
+    var choosingRole by rememberSaveable(engine) { mutableStateOf<String?>(null) }
+    var saved by rememberSaveable(engine) { mutableStateOf(false) }
+    var saving by remember(engine) { mutableStateOf(false) }
+    var reading by remember(engine) { mutableStateOf(false) }
+    var failed by remember(engine) { mutableStateOf(false) }
+
+    suspend fun readPreferences() {
+        if (reading || saving || draftJson != null) return
+        reading = true
+        failed = false
+        try {
+            val loaded = withContext(Dispatchers.IO) {
+                CoordinationPreferences.fromJson(engine.mesh.coordination.preferences()).toJson().toString()
+            }
+            baselineJson = loaded
+            draftJson = loaded
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            failed = true
+        } finally {
+            reading = false
+        }
+    }
+
+    LaunchedEffect(engine, open) { if (open) readPreferences() }
+    val draft = remember(draftJson) { draftJson?.let { CoordinationPreferences.fromJson(JSONObject(it)) } }
+
+    fun edit(next: CoordinationPreferences) {
+        draftJson = next.toJson().toString()
+        saved = false
+        // Keep a save error visible until the next explicit save attempt.
+    }
+
+    fun cancel() {
+        if (!saving) {
+            open = false
+            choosingRole = null
+            draftJson = null
+            baselineJson = null
+            failed = false
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(Spacing.xs)) {
+        SectionTitle(text.title)
+        GlassGroup {
+            SettingsActionRow(
+                title = text.title,
+                subtitle = text.pipelineNotice,
+                onClick = { saved = false; open = true },
+            )
+        }
+        if (saved) {
+            Text(
+                text.saved,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+            )
+        }
+    }
+
+    if (open && choosingRole == null) {
+        GlassDialogShell(title = text.title, onDismiss = { cancel() }) {
+            Text(text.hint, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(Spacing.xs))
+            Text(text.pipelineNotice, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (reading) {
+                SkeletonList(items = 2, modifier = Modifier.padding(vertical = Spacing.sm)
+                    .semantics { contentDescription = copy.loading })
+            }
+            if (failed) {
+                Text(
+                    text.failed,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(vertical = Spacing.sm)
+                        .semantics { liveRegion = LiveRegionMode.Polite },
+                )
+                if (draft == null) {
+                    PrimaryButton(copy.retry, onClick = { scope.launch { readPreferences() } }, enabled = !reading)
+                }
+            }
+            if (draft != null) {
+                SectionTitle(text.mode)
+                GlassGroup(Modifier.selectableGroup()) {
+                    CoordinationRadioRow(text.automatic, null, draft.mode == "automatic", !saving) {
+                        edit(draft.copy(mode = "automatic"))
+                    }
+                    GlassDivider()
+                    CoordinationRadioRow(text.manual, null, draft.mode == "manual", !saving) {
+                        edit(draft.copy(mode = "manual"))
+                    }
+                }
+                Spacer(Modifier.height(Spacing.sm))
+                GlassGroup {
+                    CoordinationPreferences.ROLE_NAMES.forEachIndexed { index, role ->
+                        if (index > 0) GlassDivider()
+                        val target = draft.target(role)
+                        val node = nodes.firstOrNull { it.id == target }
+                        val subtitle = when {
+                            target.isEmpty() -> text.automatic
+                            node == null -> "$target · ${copy.offline}"
+                            else -> listOf(
+                                node.name,
+                                if (node.self) copy.thisNode else node.id,
+                                if (node.online()) copy.online else copy.offline,
+                                text.incompatible.takeIf { !node.self && node.coordinationVersion != HomeCoordination.VERSION },
+                            ).filterNotNull().joinToString(" · ")
+                        }
+                        // No disabled-looking no-op rows while a write is in flight.
+                        if (saving) {
+                            Column(Modifier.fillMaxWidth().padding(Spacing.md)) {
+                                Text(text.roleLabel(role), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface)
+                                Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        } else {
+                            SettingsActionRow(
+                                title = text.roleLabel(role), subtitle = subtitle,
+                                onClick = { choosingRole = role },
+                            )
+                        }
+                        if (target.isNotEmpty() && (node == null || !node.online())) {
+                            Text(
+                                text = "${text.roleLabel(role)}: ${text.unavailable}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.padding(horizontal = Spacing.md, vertical = Spacing.xs),
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(Spacing.sm))
+                PrimaryButton(
+                    text = copy.save,
+                    enabled = !saving && draftJson != baselineJson,
+                    loading = saving,
+                    modifier = Modifier.fillMaxWidth(),
+                    onClick = {
+                        if (!saving) {
+                            saving = true
+                            failed = false
+                            // Snapshot the draft, then merge only selector fields into fresh preferences.
+                            // Other clients may edit roles while this human is choosing nodes.
+                            val submitted = draft
+                            scope.launch {
+                                try {
+                                    withContext(Dispatchers.IO) {
+                                        synchronized(engine.mesh) {
+                                            val current = CoordinationPreferences.fromJson(engine.mesh.coordination.preferences())
+                                            val next = current.copy(
+                                                mode = submitted.mode, brain = submitted.brain,
+                                                listener = submitted.listener, executor = submitted.executor,
+                                                responder = submitted.responder,
+                                            )
+                                            CoordinationPreferences.fromJson(
+                                                engine.mesh.coordination.updatePreferences(next.toJson()),
+                                            ).toJson().toString()
+                                        }
+                                    }
+                                    saved = true
+                                    open = false
+                                    choosingRole = null
+                                    // Next open reads fresh state; errors leave the draft untouched.
+                                    draftJson = null
+                                    baselineJson = null
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (_: Exception) {
+                                    failed = true
+                                } finally {
+                                    saving = false
+                                }
+                            }
+                        }
+                    },
+                )
+            }
+            if (!saving) GhostButton(copy.cancel, onClick = { cancel() }, modifier = Modifier.fillMaxWidth())
+        }
+    }
+
+    val role = choosingRole
+    if (open && draft != null && role != null) {
+        val target = draft.target(role)
+        fun select(id: String) {
+            val next = draft.toJson().put(role, id)
+            edit(CoordinationPreferences.fromJson(next))
+            choosingRole = null
+        }
+        GlassDialogShell(title = text.roleLabel(role), onDismiss = { choosingRole = null }) {
+            // The shell scrolls its text; the bounded keyed list virtualizes up to 128 peers.
+            GlassGroup {
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth().heightIn(max = Spacing.huge * 6).selectableGroup(),
+                ) {
+                    item(key = "automatic", contentType = "choice") {
+                        CoordinationRadioRow(text.automatic, null, target.isEmpty(), !saving) { select("") }
+                        GlassDivider()
+                    }
+                    if (target.isNotEmpty() && nodes.none { it.id == target }) {
+                        item(key = "missing-$target", contentType = "choice") {
+                            CoordinationRadioRow(target, text.unavailable, true, false) {}
+                            GlassDivider()
+                        }
+                    }
+                    items(nodes, key = { "node-${it.id}" }, contentType = { "choice" }) { node ->
+                        val compatible = node.self || node.coordinationVersion == HomeCoordination.VERSION
+                        CoordinationRadioRow(
+                            title = node.name,
+                            subtitle = listOf(
+                                node.id,
+                                copy.thisNode.takeIf { node.self },
+                                if (node.online()) copy.online else copy.offline,
+                                text.incompatible.takeIf { !compatible },
+                            ).filterNotNull().joinToString(" · "),
+                            selected = target == node.id,
+                            enabled = !saving && node.online() && compatible,
+                            onClick = { select(node.id) },
+                        )
+                        GlassDivider()
+                    }
+                }
+            }
+            if (target.isNotEmpty() && nodes.none { it.id == target && it.online() }) {
+                Text(text.unavailable, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            }
+            GhostButton(copy.back, onClick = { choosingRole = null }, modifier = Modifier.fillMaxWidth())
+        }
+    }
+}
+
+/** Flat radio rows share one glass group, with native selection and disabled semantics. */
+@Composable
+private fun CoordinationRadioRow(
+    title: String,
+    subtitle: String?,
+    selected: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+            .selectable(selected = selected, enabled = enabled, role = Role.RadioButton, onClick = onClick)
+            .padding(horizontal = Spacing.md, vertical = Spacing.sm),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
+    ) {
+        RadioButton(selected = selected, enabled = enabled, onClick = null)
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface)
+            if (subtitle != null) {
+                Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
     }
 }
 

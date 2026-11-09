@@ -746,3 +746,37 @@ fun stateSummary(device: HomeDevice): String = when (device.kind) {
 
 /** Короткий уникальный идентификатор с читаемым префиксом. */
 fun newId(prefix: String): String = "${prefix}_" + UUID.randomUUID().toString()
+
+/** Read-only metadata registry. Extensions do not grant new transport actions or arbitrary execution. */
+object CapabilityCatalog {
+    data class Descriptor(val id: String, val valueType: String, val unit: String = "", val writable: Boolean = false) {
+        fun toJson(): JSONObject = JSONObject().put("id", id).put("value_type", valueType)
+            .put("unit", unit).put("writable", writable)
+    }
+    private val descriptors = java.util.concurrent.ConcurrentHashMap<String, Descriptor>().apply {
+        listOf(
+            Descriptor("power", "boolean", writable = true),
+            Descriptor("brightness", "number", "%", true),
+            Descriptor("color_temp", "number", "K", true),
+            Descriptor("temperature", "number", "°C", true),
+            Descriptor("current_temperature", "number", "°C"),
+            Descriptor("volume", "number", "%", true),
+            Descriptor("position", "number", "%", true),
+        ).forEach { put(it.id, it) }
+    }
+    /** Additional capability discovery is read-only until an approved adapter implements writes. */
+    fun registerReadOnly(descriptor: Descriptor) {
+        require(descriptor.id.matches(Regex("[a-z][a-z0-9_.-]{0,63}")))
+        require(descriptor.valueType in setOf("boolean", "number", "string"))
+        require(descriptor.unit.length <= 16 && descriptor.unit.none { it.isISOControl() } && !descriptor.writable)
+        require(descriptors.size < 128)
+        require(descriptors.putIfAbsent(descriptor.id, descriptor) == null) { "Capability already registered" }
+    }
+    fun toJson(): JSONArray = JSONArray(descriptors.values.sortedBy { it.id }.map { it.toJson() })
+}
+
+/** LAN-safe explicit catalog allowlist: excludes state, address, entity, token and audit. */
+fun HomeDevice.catalogJson(): JSONObject = JSONObject().put("id", id).put("name", name.take(80))
+    .put("room", room.take(60)).put("kind", kind).put("adapter", adapter)
+    .put("capabilities", JSONArray(capabilities.sorted().take(64)))
+    .put("actions", JSONArray(actionsFor(kind).filter { supports(it) }))
