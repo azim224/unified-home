@@ -1,3 +1,39 @@
+# TCP discovery revision — 2026-11-10
+
+This section supersedes the UDP discovery requirement below.
+
+- PC and Android bootstrap explicit seed addresses over authenticated framed TCP,
+  sustain known peers with TCP presence, and reply to non-reply TCP announcements.
+  The optional `reply: true` announcement field prevents response loops. Older v2
+  peers ignore that field. Membership secrets and wire framing are unchanged.
+- Automatic bootstrap probes directly connected private IPv4 networks, using actual
+  interface masks, with a bounded rotating 254-address sweep. Large subnets take
+  multiple sweeps; explicit addresses remain the fast/deterministic option.
+  No public-network scanning, cloud relay or Internet port forwarding is introduced.
+- Presence/scan work is bounded separately from RPC delivery. Probes carry only
+  signed announcements, never commands. Repeated discovery is safe; uncertain
+  RPC execution is never retried or downgraded to UDP.
+- UDP is an optional compatibility accelerator. A failed UDP bind no longer blocks
+  TCP startup or Android requests/results. TCP listener recovery preserves the
+  household session and replay/execution history.
+- Both devices must still share a reachable network and allow inbound TCP on their
+  household port (default 47654). Firewall/client isolation/VPN routing cannot be
+  overridden by a transport library. Legacy UDP-only peers still need UDP.
+- Android normalizes PC's `auto` role sentinel to its empty automatic choice and
+  handles coordinator lookup failures before dispatch instead of throwing into
+  the host's generic `home_route_unavailable` branch. This does not silently run
+  locally after an uncertain remote request.
+
+Validation: source review, Python AST parsing and whitespace checks. Kotlin syntax
+was checked before the subsequent instruction forbidding toolchain execution;
+final Kotlin changes have **not** been compiled. No Gradle, Android SDK, browser,
+app server, device tests or APK builds were used after that instruction. Physical
+PC–Android discovery, Windows firewall behavior and the original device exception
+remain unverified. Install updated PC and Android plugin together to use TCP-only
+bootstrap; the pasted invitation was not applied to local membership files.
+
+---
+
 # LAN transport and settings transfer — 2026-11-09
 
 This document supersedes the UDP-only transport and no-settings-transfer statements

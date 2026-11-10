@@ -30,8 +30,6 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
-import java.net.Inet4Address
-import java.net.NetworkInterface
 
 /** Authenticated household member; host is a routing hint, never an identity. */
 data class MeshNode(
@@ -148,7 +146,7 @@ class MeshService(
     private val _lastVote = MutableStateFlow<VoteResult?>(null)
     val lastVote: StateFlow<VoteResult?> = _lastVote.asStateFlow()
 
-    val running: Boolean get() = synchronized(this) { socket?.isClosed == false && reliable?.running == true && lifecycle?.isActive == true }
+    val running: Boolean get() = synchronized(this) { reliable?.running == true && lifecycle?.isActive == true }
     val nodeId: String get() = synchronized(this) { ensureLoaded(); config.id }
     val settings: MeshConfig get() = synchronized(this) { ensureLoaded(); config }
 
@@ -345,30 +343,38 @@ class MeshService(
                 synchronized(this@MeshService) {
                     if (lifecycle !== owner) return@launch
                     publishPeers()
-                    if (socket?.isClosed != false || reliable?.running != true) {
-                        socket?.close()
-                        socket = null
+                    if (reliable?.running != true) {
                         reliable?.close()
                         reliable = null
-                        var udp: DatagramSocket? = null
                         try {
-                            val bound = DatagramSocket(null)
-                            udp = bound
-                            bound.reuseAddress = true
-                            bound.broadcast = true
-                            bound.soTimeout = 1_000
-                            bound.bind(InetSocketAddress(config.port))
-                            val tcp = ReliableTransport(config.port) { payload, host ->
-                                dispatch(bound, payload, payload.size, host)
+                            val generation = session
+                            reliable = ReliableTransport(config.port) { payload, host ->
+                                if (synchronized(this@MeshService) { session == generation && lifecycle === owner }) {
+                                    dispatch(null, payload, payload.size, host)
+                                }
                             }
-                            socket = bound
-                            reliable = tcp
                             _error.value = ""
-                            childScope.launch { receiveLoop(bound) }
                             discovery.trySend(Unit)
                         } catch (_: Exception) {
-                            udp?.close()
-                            _error.value = "Не удалось открыть порт сети дома. Повторяем подключение."
+                            _error.value = "Не удалось открыть TCP-порт дома. Повторяем подключение."
+                        }
+                    }
+                    // UDP is optional discovery acceleration, never a prerequisite for TCP.
+                    if (socket?.isClosed != false) {
+                        socket?.close()
+                        socket = null
+                        var bound: DatagramSocket? = null
+                        try {
+                            val receiver = DatagramSocket(null)
+                            bound = receiver
+                            receiver.reuseAddress = true
+                            receiver.broadcast = true
+                            receiver.soTimeout = 1_000
+                            receiver.bind(InetSocketAddress(config.port))
+                            socket = receiver
+                            childScope.launch { receiveLoop(receiver) }
+                        } catch (_: Exception) {
+                            bound?.close()
                         }
                     }
                 }
@@ -461,58 +467,65 @@ class MeshService(
         .put("coordination_version", HomeCoordination.VERSION).put("secure_version", SecureHome.VERSION)
 
     private suspend fun announceLoop(owner: Job) {
+        var nextScan = 0L
+        var scanOffset = 0L
+        var scan: Job? = null
+        var presence: Job? = null
         while (currentCoroutineContext().isActive) {
             withTimeoutOrNull(ANNOUNCE_INTERVAL_MS) { discovery.receive() }
             val snapshot = synchronized(this) {
                 if (lifecycle !== owner) return
                 publishPeers()
-                val udp = socket ?: return@synchronized null
+                val tcp = reliable?.takeIf { it.running } ?: return@synchronized null
                 val member = credentials ?: return@synchronized null
                 val payload = HomeLink.encode(member, config.id, session, announcement()) ?: return@synchronized null
-                Triple(udp, payload, config to peers.values.toList())
+                Triple(tcp, payload, config to peers.values.toList())
             } ?: continue
-            val (udp, payload, destinations) = snapshot
+            val (tcp, payload, destinations) = snapshot
             val (settings, knownPeers) = destinations
-            val targets = linkedSetOf("255.255.255.255")
-            try {
-                val interfaces = NetworkInterface.getNetworkInterfaces()
-                while (interfaces != null && interfaces.hasMoreElements()) {
-                    val iface = interfaces.nextElement()
-                    if (!iface.isUp || iface.isLoopback) continue
-                    iface.interfaceAddresses.forEach { address ->
-                        (address.broadcast as? Inet4Address)?.hostAddress?.let { targets.add(it) }
-                    }
-                }
-            } catch (_: Exception) {
-                // Global broadcast and explicit seeds remain available if interface enumeration fails.
+            val current = { synchronized(this) { lifecycle === owner && reliable === tcp && tcp.running } }
+            // Explicit addresses and authenticated peers work even when every UDP packet is filtered.
+            val endpoints = knownPeers.filter { it.tcpPort != null }
+                .map { it.host to (it.tcpPort ?: it.port) }.toMutableSet()
+            settings.seeds.forEach { endpoints.add(it to settings.port) }
+            if (presence?.isActive != true) {
+                presence = workers?.launch { LanDiscovery.probe(endpoints.toList(), payload, current, 1_000) }
             }
-            targets.addAll(settings.seeds)
-            val endpoints = targets.map { it to settings.port }.toMutableSet()
-            // Broadcast may be filtered after seed bootstrap; sustain mutual presence by unicast.
-            knownPeers.forEach { endpoints.add(it.host to it.port) }
-            for ((target, port) in endpoints) {
-                if (!currentCoroutineContext().isActive ||
-                    !synchronized(this) { lifecycle === owner && socket === udp && !udp.isClosed }) break
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now >= nextScan && scan?.isActive != true) {
+                nextScan = now + 30_000L
+                val candidates = LanDiscovery.candidates(scanOffset)
+                scanOffset += 254L
+                scan = workers?.launch {
+                    LanDiscovery.probe(candidates, settings.port, payload, current)
+                }
+            }
+            // Legacy peers can still bootstrap over broadcast; all upgraded delivery is TCP.
+            val udp = synchronized(this) { socket?.takeUnless { it.isClosed } } ?: continue
+            val legacyTargets = LanDiscovery.broadcasts().toMutableSet().apply {
+                addAll(settings.seeds)
+                knownPeers.filter { it.tcpPort == null }.forEach { add(it.host) }
+            }
+            val legacyPayload = synchronized(this) {
+                credentials?.let { HomeLink.encode(it, config.id, session, announcement()) }
+            } ?: continue
+            for (target in legacyTargets) {
+                if (!current()) break
                 try {
-                    // Resolve all IPv4 addresses: localhost/dual-stack names must not hide LAN IPv4.
-                    InetAddress.getAllByName(target).filterIsInstance<Inet4Address>().forEach { address ->
-                        if (!currentCoroutineContext().isActive ||
-                            !synchronized(this) { lifecycle === owner && socket === udp && !udp.isClosed }) return@forEach
-                        udp.send(DatagramPacket(payload, payload.size, address, port))
-                    }
-                } catch (_: Exception) {
-                    // A failed route/seed must not suppress other interfaces or stop discovery.
+                    udp.send(DatagramPacket(legacyPayload, legacyPayload.size, InetAddress.getByName(target), settings.port))
+                } catch (_: java.io.IOException) {
+                    // Optional broadcast loss does not interrupt TCP presence or RPC.
                 }
             }
         }
     }
 
-    private fun dispatch(udp: DatagramSocket, payload: ByteArray, length: Int, host: String) {
+    private fun dispatch(udp: DatagramSocket?, payload: ByteArray, length: Int, host: String) {
         val work = synchronized(this) {
-            if (socket !== udp || udp.isClosed || lifecycle?.isActive != true || length !in 1..HomeLink.MAX_PACKET) return
+            if ((udp != null && (socket !== udp || udp.isClosed)) || lifecycle?.isActive != true || length !in 1..HomeLink.MAX_PACKET) return
             val member = credentials ?: return
             val message = HomeLink.decode(member, payload, length) ?: return
-            handle(udp, message, host)
+            handle(udp, message, host, tcp = udp == null)
         }
         work?.start() // No application callback under the mesh monitor, on either transport.
     }
@@ -546,7 +559,7 @@ class MeshService(
     }
 
     /** Called under monitor; only lazy job construction is allowed here, not user code. */
-    private fun handle(udp: DatagramSocket, message: HomeLink.Message, host: String): Job? {
+    private fun handle(udp: DatagramSocket?, message: HomeLink.Message, host: String, tcp: Boolean): Job? {
         if (message.id == config.id || host.isBlank()) return null
         val now = System.currentTimeMillis()
         replay.entries.removeAll { now - it.value > REPLAY_TTL_MS }
@@ -555,6 +568,7 @@ class MeshService(
         replay[replayKey] = now
         val body = message.body
         if (body.opt("t") == "announce") {
+            if (body.has("reply") && body.opt("reply") !is Boolean) return null
             val name = body.opt("name") as? String ?: return null
             val role = body.opt("role") as? String ?: return null
             val priority = HomeLink.integer(body, "priority") ?: return null
@@ -588,9 +602,9 @@ class MeshService(
                 coordinationVersion = HomeLink.integer(body, "coordination_version")?.takeIf { it == HomeCoordination.VERSION } ?: 0,
                 secureVersion = HomeLink.integer(body, "secure_version")?.takeIf { it == SecureHome.VERSION } ?: 0,
                 tcpPort = tcpPort)
-            if (newlySeen || previousSession != message.session) {
-                // Bootstrap mutual presence once, not a reply storm for every heartbeat.
-                send(udp, announcement(), peers[message.id], discoveryOnly = true)
+            if ((tcp && !body.optBoolean("reply")) || (!tcp && (newlySeen || previousSession != message.session))) {
+                // A fresh probe repairs one-way presence; reply markers prevent ping-pong.
+                send(udp, announcement().put("reply", true), peers[message.id])
             }
             publishPeers()
             return null
@@ -651,7 +665,7 @@ class MeshService(
                             // A socket rebind is not a membership/session change. Reply on the live route.
                             val currentSocket = socket
                             val currentPeer = peers[peer.id]
-                            if (currentSocket != null && session == ourSession &&
+                            if (running && session == ourSession &&
                                 currentPeer?.session == peer.session && currentPeer.online()) {
                                 if (!sendResult(currentSocket, currentPeer, id, operation, result)) {
                                     sendResult(currentSocket, currentPeer, id, operation, failure("Remote result unavailable"))
@@ -674,7 +688,7 @@ class MeshService(
     }
 
     /** Under mesh monitor; never invokes the optional application handler here. */
-    private fun handleSecure(udp: DatagramSocket, message: HomeLink.Message, peer: MeshNode): Job? {
+    private fun handleSecure(udp: DatagramSocket?, message: HomeLink.Message, peer: MeshNode): Job? {
         if (peer.secureVersion != SecureHome.VERSION) return null
         val member = credentials ?: return null
         val opened = SecureHome.open(member, message, config.id, session) ?: return null
@@ -729,7 +743,7 @@ class MeshService(
             synchronized(this@MeshService) {
                 val currentSocket = socket
                 val currentPeer = peers[peer.id]
-                if (currentSocket != null && session == ourSession &&
+                if (running && session == ourSession &&
                     currentPeer?.session == peer.session && currentPeer.online()) {
                     if (!sendSecureResult(currentSocket, currentPeer, opened.id, opened.timeoutMs, result)) {
                         sendSecureResult(currentSocket, currentPeer, opened.id, opened.timeoutMs, SecureHome.failure("Secure result could not be sent"))
@@ -742,7 +756,7 @@ class MeshService(
         return requestJob
     }
 
-    private fun sendSecureResult(udp: DatagramSocket, peer: MeshNode, id: String, timeoutMs: Long, result: JSONObject): Boolean {
+    private fun sendSecureResult(udp: DatagramSocket?, peer: MeshNode, id: String, timeoutMs: Long, result: JSONObject): Boolean {
         val member = credentials ?: return false
         return try {
             send(udp, SecureHome.seal(member, config.id, session, peer.id, peer.session,
@@ -769,7 +783,7 @@ class MeshService(
             val udp = socket
             val member = credentials
             val peer = peers[nodeId]
-            if (udp == null || !running || member == null || peer == null || !peer.online()) {
+            if (!running || member == null || peer == null || !peer.online()) {
                 return@withContext SecureHome.failure("Secure node unavailable")
             }
             if (peer.secureVersion != SecureHome.VERSION) return@withContext SecureHome.failure("Secure RPC unavailable")
@@ -800,7 +814,7 @@ class MeshService(
         return JSONObject().put("ok", ok).put("data", data).put("error", if (ok) "" else "Remote request failed")
     }
 
-    private fun sendResult(udp: DatagramSocket, peer: MeshNode, id: String, operation: String, result: JSONObject): Boolean =
+    private fun sendResult(udp: DatagramSocket?, peer: MeshNode, id: String, operation: String, result: JSONObject): Boolean =
         send(udp, JSONObject().put("t", "result").put("to", peer.id).put("to_session", peer.session)
             .put("request_id", id).put("op", operation).put("ok", result.getBoolean("ok"))
             .put("data", result.getJSONObject("data")).put("error", result.getString("error")), peer)
@@ -816,7 +830,7 @@ class MeshService(
             ensureLoaded()
             val udp = socket
             val peer = peers[nodeId]
-            if (udp == null || !running || credentials == null || peer == null || !peer.online()) {
+            if (!running || credentials == null || peer == null || !peer.online()) {
                 return@withContext failure("Node unavailable")
             }
             if (operation !in peer.services) return@withContext failure("Operation unavailable")
@@ -880,20 +894,19 @@ class MeshService(
     }
 
     /** Under mesh monitor. TCP is bounded/queued; never retry an uncertain send over UDP. */
-    private fun send(udp: DatagramSocket, body: JSONObject, peer: MeshNode? = null,
-        discoveryOnly: Boolean = false): Boolean {
-        if (socket !== udp || udp.isClosed || lifecycle?.isActive != true) return false
+    private fun send(udp: DatagramSocket?, body: JSONObject, peer: MeshNode? = null): Boolean {
+        if ((udp != null && (socket !== udp || udp.isClosed)) || !running) return false
         val member = credentials ?: return false
         val kind = body.optString("t")
         val requestId = body.optString("request_id")
         if (!requestCurrent(kind, requestId)) return false
         return try {
             val payload = HomeLink.encode(member, config.id, session, body) ?: return false
-            if (peer != null && peer.tcpPort != null && !discoveryOnly) {
+            if (peer != null && peer.tcpPort != null) {
                 val generation = session
                 reliable?.send(peer.host, peer.tcpPort, payload) {
                     synchronized(this@MeshService) {
-                        socket === udp && session == generation &&
+                        running && session == generation &&
                             peers[peer.id]?.let {
                                 it.session == peer.session && it.host == peer.host &&
                                     it.tcpPort == peer.tcpPort && it.online()
@@ -902,6 +915,7 @@ class MeshService(
                     }
                 } == true
             } else {
+                if (udp == null || udp.isClosed) return false
                 val address = InetAddress.getByName(peer?.host ?: "255.255.255.255")
                 if (!requestCurrent(kind, requestId)) return false
                 udp.send(DatagramPacket(payload, payload.size, address, peer?.port ?: config.port))

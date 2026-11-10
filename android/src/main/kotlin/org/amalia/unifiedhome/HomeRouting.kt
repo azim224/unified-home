@@ -220,8 +220,10 @@ class HomeRouting(private val home: HomeEngine, private val host: HostServices, 
         }
         val result = JSONObject()
         for (role in listOf("brain", "executor", "responder")) {
-            val localTarget = if (localPreferences.optString("mode") == "manual") localPreferences.optString(role) else ""
-            val selected = localTarget.ifBlank { if (preferences.optString("mode") == "manual") preferences.optString(role) else "" }
+            val localTarget = if (localPreferences.optString("mode") == "manual") localPreferences.optString(role).takeUnless { it == "auto" }.orEmpty() else ""
+            val selected = localTarget.ifBlank {
+                if (preferences.optString("mode") == "manual") preferences.optString(role).takeUnless { it == "auto" }.orEmpty() else ""
+            }
             if (selected.isNotBlank()) result.put(role, selected)
             else result.put(role, if (role == "executor") result.optString("brain", home.mesh.nodeId) else home.mesh.nodeId)
         }
@@ -233,7 +235,14 @@ class HomeRouting(private val home: HomeEngine, private val host: HostServices, 
         if (!home.mesh.membership().optBoolean("joined")) return null
         if (!home.mesh.running) return failure("Household transport unavailable; no silent local fallback")
         require(HomeLink.validUuid(requestId) && text.isNotBlank())
-        val targets = targets()
+        // Role lookup is read-only. Report its failure before dispatch instead of throwing
+        // into the host's generic home_route_unavailable branch on every foreground turn.
+        val targets = try { targets() }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (error: Exception) {
+            android.util.Log.w("UnifiedHome", "Home role lookup failed: ${error.javaClass.simpleName}")
+            return failure("Coordinator unavailable; nothing dispatched")
+        }
         val brain = targets.optString("brain", home.mesh.nodeId)
         val responder = targets.optString("responder", home.mesh.nodeId)
         val executor = targets.optString("executor", brain)

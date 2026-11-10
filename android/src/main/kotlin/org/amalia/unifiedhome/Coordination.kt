@@ -46,7 +46,7 @@ data class CoordinationPreferences(
                 require(!json.has(key) || json.opt(key) is String)
                 val value = json.optString(key)
                 require(value.isEmpty() || HomeLink.validText(value, 128))
-                return value
+                return value.takeUnless { it == "auto" }.orEmpty()
             }
             require(!json.has("roles") || json.opt("roles") is JSONArray)
             val array = json.optJSONArray("roles") ?: JSONArray(ROLE_NAMES)
