@@ -55,7 +55,19 @@ jobs:
           set -euo pipefail
           [ -n "$GH_TOKEN" ] || { echo "::error::Set AMALIA_TOKEN with Actions read access to azim224/amalia-3.0"; exit 1; }
           [[ "$SDK_RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::Set sdk_run_id or AMALIA_SDK_RUN_ID to the successful exact-host SDK run ID"; exit 1; }
-          gh api "repos/azim224/amalia-3.0/actions/runs/$SDK_RUN_ID" > "$RUNNER_TEMP/sdk-run.json"
+          # A host push starts SDK export concurrently with this plugin build.
+          # Wait for this exact run rather than compiling against a stale host API.
+          for attempt in $(seq 1 90); do
+            gh api "repos/azim224/amalia-3.0/actions/runs/$SDK_RUN_ID" > "$RUNNER_TEMP/sdk-run.json"
+            STATE="$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["path"] == ".github/workflows/native-sdk.yml", "Wrong SDK workflow"; print(r["status"])' "$RUNNER_TEMP/sdk-run.json")"
+            if [ "$STATE" = "completed" ]; then break; fi
+            if [ "$attempt" = "90" ]; then
+              echo "::error::Timed out waiting for the exact-host Native SDK run"
+              exit 1
+            fi
+            echo "Waiting for Native SDK run $SDK_RUN_ID ($STATE)"
+            sleep 20
+          done
           python3 - <<'PY'
           import json, os
           from pathlib import Path
