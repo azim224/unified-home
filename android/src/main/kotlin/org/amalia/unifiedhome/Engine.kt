@@ -95,15 +95,24 @@ class HomeEngine(context: Context, private val scope: CoroutineScope) {
         steps: List<SceneStep>,
         sceneId: String = "",
         remote: Boolean = false,
-    ): Plan = coroutineScope {
-        val planned = steps
-            .map { step -> async(Dispatchers.IO) { planStep(step) } }
-            .awaitAll()
+    ): Plan = operations.withLock { coroutineScope {
+        // Independent devices can be read in parallel; repeated steps must see
+        // the state projected by the preceding step, not the original snapshot.
+        val planned = steps.withIndex()
+            .groupBy { store.device(it.value.deviceId)?.id ?: it.value.deviceId }
+            .values.map { group -> async(Dispatchers.IO) {
+                var projected: Map<String, Any?>? = null
+                group.map { indexed ->
+                    val step = planStep(indexed.value, projected)
+                    if (step.status != StepStatus.BLOCKED) projected = step.before + step.after
+                    indexed.index to step
+                }
+            } }.awaitAll().flatten().sortedBy { it.first }.map { it.second }
         (if (remote) remoteExecutable else plans).add(
             Plan(token = newId("plan"), title = title, steps = planned, sceneId = sceneId))
-    }
+    } }
 
-    private suspend fun planStep(step: SceneStep): PlannedStep {
+    private suspend fun planStep(step: SceneStep, projected: Map<String, Any?>? = null): PlannedStep {
         val device = store.device(step.deviceId)
             ?: return PlannedStep(
                 step.deviceId, step.deviceId, step.action, step.params,
@@ -124,16 +133,13 @@ class HomeEngine(context: Context, private val scope: CoroutineScope) {
                 status = StepStatus.BLOCKED, reason = error.message ?: "Неверные параметры.",
             )
         }
-        val snapshot = readDevice(device)
+        val snapshot = if (projected == null) readDevice(device) else ReadResult(true, projected)
         if (!snapshot.ok) {
             return PlannedStep(
                 device.id, device.name, step.action, params,
                 status = StepStatus.BLOCKED,
                 reason = "Состояние неизвестно: ${snapshot.error}",
             )
-        }
-        if (snapshot.state.isNotEmpty()) {
-            store.saveDevice(device.copy(state = snapshot.state))
         }
         val desired = projectState(device.copy(state = snapshot.state), step.action, params)
         val alreadyThere = step.action != Action.TOGGLE && matches(desired, snapshot.state)
@@ -178,7 +184,7 @@ class HomeEngine(context: Context, private val scope: CoroutineScope) {
             }
             val result = try { when (step.status) {
                 StepStatus.BLOCKED -> StepResult(ApplyStatus.FAILED, step.reason)
-                else -> executeStep(step, "${plan.token}:$index")
+                else -> executeStep(step, "${plan.token}:$index", owner)
             } } catch (error: CancellationException) { throw error
             } catch (error: Exception) {
                 // Execution may already have reached hardware before persistence failed.
@@ -218,7 +224,7 @@ class HomeEngine(context: Context, private val scope: CoroutineScope) {
         summary
     } }
 
-    private suspend fun executeStep(step: PlannedStep, key: String): StepResult {
+    private suspend fun executeStep(step: PlannedStep, key: String, owner: RemoteOwner?): StepResult {
         val device = store.device(step.deviceId)
             ?: return StepResult(ApplyStatus.FAILED, "Устройство исчезло из дома.")
         // Re-read at application time, including steps previously marked "already so".
@@ -236,6 +242,15 @@ class HomeEngine(context: Context, private val scope: CoroutineScope) {
         val action = if (step.action == Action.TOGGLE) {
             if (step.after["power"] == true) Action.ON else Action.OFF
         } else step.action
+        currentCoroutineContext().ensureActive()
+        if (owner != null) {
+            val peer = mesh.nodes.value.firstOrNull { it.id == owner.node && !it.self }
+            if (peer == null || peer.session != owner.session || !peer.online() ||
+                mesh.membership().optString("home_id") != owner.home ||
+                mesh.nodes.value.firstOrNull { it.self }?.session != owner.receiver) {
+                return StepResult(ApplyStatus.FAILED, "Дом изменился после планирования.")
+            }
+        }
         val outcome = applyDevice(fresh, action, step.params, key)
         if (outcome.state.isNotEmpty()) store.saveDevice(fresh.copy(state = outcome.state))
         return StepResult(outcome.status, outcome.error)
@@ -251,6 +266,8 @@ class HomeEngine(context: Context, private val scope: CoroutineScope) {
     ): ApplyOutcome = operations.withLock { withContext(Dispatchers.IO) {
         val device = store.device(deviceRef)
             ?: return@withContext ApplyOutcome(false, ApplyStatus.FAILED, error = "Устройство не найдено.")
+        if (!device.supports(action)) return@withContext ApplyOutcome(
+            false, ApplyStatus.FAILED, error = "Устройство не поддерживает действие.")
         val snapshot = readDevice(device)
         if (!snapshot.ok) return@withContext ApplyOutcome(false, ApplyStatus.FAILED, error = snapshot.error)
         val fresh = device.copy(state = snapshot.state)
@@ -271,13 +288,15 @@ class HomeEngine(context: Context, private val scope: CoroutineScope) {
     } }
 
     /** Перечитывает состояние устройства и сохраняет его. */
-    suspend fun refresh(device: HomeDevice): ReadResult = withContext(Dispatchers.IO) {
-        val snapshot = readDevice(device)
+    suspend fun refresh(device: HomeDevice): ReadResult = operations.withLock { withContext(Dispatchers.IO) {
+        val latest = store.device(device.id)
+            ?: return@withContext ReadResult(false, error = "Устройство исчезло из дома.")
+        val snapshot = readDevice(latest)
         if (snapshot.ok && snapshot.state.isNotEmpty()) {
-            store.saveDevice(device.copy(state = snapshot.state))
+            store.saveDevice(latest.copy(state = snapshot.state))
         }
         snapshot
-    }
+    } }
 
     // ── Устройства и сцены ──────────────────────────────────────────────────
 

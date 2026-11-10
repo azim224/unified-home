@@ -72,6 +72,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
     private var meshRequested = false
     @Volatile private var engine: HomeEngine? = null
     @Volatile private var routing: HomeRouting? = null
+    @Volatile private var settingsTransfer: HomeSettingsTransfer? = null
 
     @Synchronized
     override fun onLoaded(context: PluginContext) {
@@ -82,7 +83,8 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
         appContext = context.appContext
         engine = HomeEngine(context.appContext, created).also { home ->
             home.mesh.coordination.attach(home)
-            routing = HomeRouting(home, context.services)
+            settingsTransfer = HomeSettingsTransfer(home, context.services, created)
+            routing = HomeRouting(home, context.services, settingsTransfer)
             home.mesh.secureHandler = { operation, args, from, session ->
                 routing?.handle(operation, args, from, session)
                     ?: org.json.JSONObject().put("ok", false).put("data", org.json.JSONObject()).put("error", "Home unavailable")
@@ -95,6 +97,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
         // Движок и его scope сохраняются при выключении; отменены только дети.
         // Повторяем загрузку, если предыдущую попытку прервало выключение.
         val home = engine ?: return
+        settingsTransfer?.start()
         home.mesh.coordination.setVoiceHookEnabled(true)
         home.load()
         meshRequested = true
@@ -112,6 +115,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
     @Synchronized
     override fun onDisabled() {
         meshRequested = false
+        settingsTransfer?.stop()
         engine?.mesh?.coordination?.setVoiceHookEnabled(false)
         engine?.stopMesh()
         scope?.coroutineContext?.cancelChildren()
@@ -120,10 +124,12 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
     @Synchronized
     override fun onUnloaded() {
         meshRequested = false
+        settingsTransfer?.stop()
         engine?.mesh?.coordination?.setVoiceHookEnabled(false)
         engine?.stopMesh()
         engine = null
         routing = null
+        settingsTransfer = null
         scope?.cancel()
         scope = null
         services = null
@@ -154,8 +160,10 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
     /** Typed host callback: metadata only, before wake acknowledgement or recording starts. */
     override suspend fun arbitrateWake(request: WakeArbitrationRequest): Boolean {
         val mesh = engine?.mesh ?: return true
-        // An unconfigured/offline installation keeps the normal local voice experience.
-        if (!mesh.membership().optBoolean("joined") || !mesh.running) return true
+        // An unconfigured installation keeps local voice. A joined household
+        // with failed transport cannot prove that another microphone is idle.
+        if (!mesh.membership().optBoolean("joined")) return true
+        if (!mesh.running) return false
         return try {
             // Stay below the host's 1400 ms fail-open deadline. Joined-household RPC
             // failures must instead suppress this turn, never create a second listener.
@@ -208,7 +216,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
                 title = "Единый дом",
                 inNavigation = true,
                 iconName = "lamp",
-                content = { host -> HomeScreen(home, host) },
+                content = { host -> HomeScreen(home, host, settingsTransfer) },
             ),
         )
     }

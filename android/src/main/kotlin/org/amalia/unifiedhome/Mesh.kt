@@ -1,6 +1,9 @@
 package org.amalia.unifiedhome
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.util.AtomicFile
 import kotlinx.coroutines.CancellationException
@@ -12,6 +15,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -26,6 +30,8 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.Inet4Address
+import java.net.NetworkInterface
 
 /** Authenticated household member; host is a routing hint, never an identity. */
 data class MeshNode(
@@ -42,6 +48,7 @@ data class MeshNode(
     val services: List<String> = emptyList(),
     val coordinationVersion: Int = 0,
     val secureVersion: Int = 0,
+    val tcpPort: Int? = null,
 ) {
     fun online(now: Long = System.currentTimeMillis()): Boolean =
         self || now - lastSeenAt <= MeshService.NODE_TTL_MS
@@ -64,6 +71,7 @@ data class MeshConfig(
     val priority: Int = 10,
     val port: Int = MeshService.DEFAULT_PORT,
     val coordination: CoordinationPreferences = CoordinationPreferences(),
+    val seeds: List<String> = emptyList(),
 )
 
 class MeshService(
@@ -73,7 +81,7 @@ class MeshService(
 ) {
     companion object {
         const val DEFAULT_PORT = 47654
-        const val NODE_TTL_MS = 15_000L
+        const val NODE_TTL_MS = 45_000L
         const val VOTE_WINDOW_MS = 150L
         private const val ANNOUNCE_INTERVAL_MS = 5_000L
         private const val MAX_PEERS = 128
@@ -85,11 +93,11 @@ class MeshService(
 
     private data class Pending(
         val peer: String, val peerSession: String, val operation: String,
-        val result: CompletableDeferred<JSONObject>,
+        val result: CompletableDeferred<JSONObject>, val caller: Job?, val expiresAt: Long,
     )
     private data class SecurePending(
         val peer: String, val peerSession: String, val timeoutMs: Long,
-        val result: CompletableDeferred<JSONObject>,
+        val result: CompletableDeferred<JSONObject>, val caller: Job?, val expiresAt: Long,
     )
     private data class RequestKey(val peer: String, val session: String, val request: String)
     private data class ReplayKey(val peer: String, val session: String, val nonce: String)
@@ -102,6 +110,9 @@ class MeshService(
     private var session = HomeLink.uuid()
     private var requestedStart = false
     private var socket: DatagramSocket? = null
+    private var reliable: ReliableTransport? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val discovery = Channel<Unit>(Channel.CONFLATED)
     private var lifecycle: Job? = null
     private var workers: CoroutineScope? = null
     private var multicastLock: WifiManager.MulticastLock? = null
@@ -137,7 +148,7 @@ class MeshService(
     private val _lastVote = MutableStateFlow<VoteResult?>(null)
     val lastVote: StateFlow<VoteResult?> = _lastVote.asStateFlow()
 
-    val running: Boolean get() = synchronized(this) { socket?.isClosed == false && lifecycle?.isActive == true }
+    val running: Boolean get() = synchronized(this) { socket?.isClosed == false && reliable?.running == true && lifecycle?.isActive == true }
     val nodeId: String get() = synchronized(this) { ensureLoaded(); config.id }
     val settings: MeshConfig get() = synchronized(this) { ensureLoaded(); config }
 
@@ -186,20 +197,22 @@ class MeshService(
     }
 
     @Synchronized
-    fun updateConfig(name: String? = null, role: String? = null, priority: Int? = null, port: Int? = null): MeshConfig {
+    fun updateConfig(name: String? = null, role: String? = null, priority: Int? = null, port: Int? = null, seeds: List<String>? = null): MeshConfig {
         ensureLoaded()
         val next = config.copy(
             name = name?.trim()?.takeIf { HomeLink.validText(it, 128) } ?: config.name,
             role = role?.trim()?.takeIf { HomeLink.validText(it, 32) } ?: config.role,
             priority = (priority ?: config.priority).coerceIn(0, 100),
             port = (port ?: config.port).coerceIn(1024, 65_535),
+            seeds = seeds?.let { validateSeeds(it) } ?: config.seeds,
         )
         // Corrupt storage can only be replaced by an explicit membership action, not config edits.
         check(storageHealthy) { "Home storage unavailable" }
         persist(next, credentials)
-        val restart = running && next.port != config.port
+        val restart = requestedStart && next.port != config.port
         config = next
         if (restart) { stopTransport(); start() }
+        discovery.trySend(Unit)
         _home.value = publicMembership()
         publishPeers()
         return config
@@ -251,7 +264,12 @@ class MeshService(
                     HomeLink.parseInvite("amalia-home:v2:${member.getString("home")}:${member.getString("key")}")
                 }
                 config = MeshConfig(id, name, role, priority, port,
-                    json.optJSONObject("coordination")?.let { CoordinationPreferences.fromJson(it) } ?: CoordinationPreferences())
+                    json.optJSONObject("coordination")?.let { CoordinationPreferences.fromJson(it) } ?: CoordinationPreferences(),
+                    if (!json.has("seeds")) emptyList() else {
+                        val seeds = json.getJSONArray("seeds")
+                        require(seeds.length() <= 32)
+                        validateSeeds((0 until seeds.length()).map { seeds.get(it) as? String ?: error("Invalid seed") })
+                    })
                 credentials = next
             }
             persist(config, credentials) // Also make a newly generated node id durable before networking.
@@ -267,7 +285,7 @@ class MeshService(
     private fun persist(settings: MeshConfig, member: HomeLink.Credentials?) {
         val json = JSONObject().put("id", settings.id).put("name", settings.name).put("role", settings.role)
             .put("priority", settings.priority).put("port", settings.port)
-            .put("coordination", settings.coordination.toJson())
+            .put("coordination", settings.coordination.toJson()).put("seeds", JSONArray(settings.seeds))
         if (member == null) json.put("membership", JSONObject.NULL) else {
             val parts = HomeLink.invite(member).split(':')
             json.put("membership", JSONObject().put("home", member.home).put("key", parts[3]))
@@ -286,42 +304,98 @@ class MeshService(
         }
     }
 
+    /** Hosts only: no scheme/path/port, no DNS lookup while validating persisted settings. */
+    private fun validateSeeds(values: List<String>): List<String> {
+        require(values.size <= 32) { "At most 32 seed hosts" }
+        return values.map { value ->
+            val host = value.trim()
+            require(host.length in 1..253 && host.split('.').all { label ->
+                label.length in 1..63 && label.first().isLetterOrDigit() && label.last().isLetterOrDigit() &&
+                    label.all { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '-' }
+            }) { "Seed must be an IPv4 address or hostname without URL or port" }
+            if (host.all { it in '0'..'9' || it == '.' }) {
+                require(host.split('.').let { parts ->
+                    parts.size == 4 && parts.all { part -> part.toIntOrNull()?.let { it in 0..255 } == true }
+                }) {
+                    "Invalid IPv4 seed"
+                }
+            }
+            host.lowercase(java.util.Locale.ROOT)
+        }.distinct()
+    }
+
     @Synchronized
     fun start() {
         requestedStart = true
         ensureLoaded()
-        if (running) return
+        if (lifecycle?.isActive == true) { discovery.trySend(Unit); return }
         stopTransport()
         if (!scope.isActive || !storageHealthy || credentials == null) return
         _error.value = ""
-        val udp = try {
-            DatagramSocket(null).also {
-                try {
-                    it.reuseAddress = true
-                    it.broadcast = true
-                    it.soTimeout = 1_000
-                    it.bind(InetSocketAddress(config.port))
-                } catch (error: Exception) { it.close(); throw error }
-            }
-        } catch (_: Exception) {
-            _error.value = "Не удалось открыть порт сети дома."
-            return
-        }
-        socket = udp
         val owner = SupervisorJob(scope.coroutineContext[Job])
         lifecycle = owner
         val childScope = CoroutineScope(scope.coroutineContext + owner + Dispatchers.IO)
         workers = childScope
         acquireMulticastLock()
-        owner.invokeOnCompletion { synchronized(this) { if (socket === udp) stopTransport() } }
-        val receive = childScope.launch(start = CoroutineStart.LAZY) { receiveLoop(udp) }
-        val announce = childScope.launch(start = CoroutineStart.LAZY) { announceLoop(udp) }
-        receive.invokeOnCompletion { stopIfCurrent(udp) }
-        announce.invokeOnCompletion { stopIfCurrent(udp) }
-        receive.start()
-        announce.start()
-        if (!owner.isActive) stopTransport()
+        registerNetworkCallback()
+        owner.invokeOnCompletion { synchronized(this) { if (lifecycle === owner) stopTransport() } }
+        // Bind/receive failures never erase requestedStart. Retry even without Android callbacks.
+        childScope.launch {
+            while (currentCoroutineContext().isActive) {
+                synchronized(this@MeshService) {
+                    if (lifecycle !== owner) return@launch
+                    publishPeers()
+                    if (socket?.isClosed != false || reliable?.running != true) {
+                        socket?.close()
+                        socket = null
+                        reliable?.close()
+                        reliable = null
+                        var udp: DatagramSocket? = null
+                        try {
+                            val bound = DatagramSocket(null)
+                            udp = bound
+                            bound.reuseAddress = true
+                            bound.broadcast = true
+                            bound.soTimeout = 1_000
+                            bound.bind(InetSocketAddress(config.port))
+                            val tcp = ReliableTransport(config.port) { payload, host ->
+                                dispatch(bound, payload, payload.size, host)
+                            }
+                            socket = bound
+                            reliable = tcp
+                            _error.value = ""
+                            childScope.launch { receiveLoop(bound) }
+                            discovery.trySend(Unit)
+                        } catch (_: Exception) {
+                            udp?.close()
+                            _error.value = "Не удалось открыть порт сети дома. Повторяем подключение."
+                        }
+                    }
+                }
+                delay(1_000)
+            }
+        }
+        childScope.launch { announceLoop(owner) }
         publishPeers()
+    }
+
+    private fun registerNetworkCallback() {
+        val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) { discovery.trySend(Unit) }
+            override fun onLost(network: Network) { discovery.trySend(Unit) }
+            override fun onLinkPropertiesChanged(network: Network, properties: android.net.LinkProperties) {
+                discovery.trySend(Unit)
+            }
+        }
+        try {
+            // LAN-only Wi-Fi/Ethernet can be useful without INTERNET or VALIDATED capabilities.
+            manager.registerNetworkCallback(NetworkRequest.Builder().clearCapabilities().build(), callback)
+            networkCallback = callback
+        } catch (_: Exception) {
+            // Missing host permission/callback quota does not prevent periodic socket recovery.
+            networkCallback = null
+        }
     }
 
     @Synchronized
@@ -333,6 +407,13 @@ class MeshService(
     private fun stopTransport() {
         val old = socket
         socket = null
+        reliable?.close()
+        reliable = null
+        networkCallback?.let { callback ->
+            runCatching { (context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
+                ?.unregisterNetworkCallback(callback) }
+        }
+        networkCallback = null
         val job = lifecycle
         lifecycle = null
         workers = null
@@ -361,9 +442,6 @@ class MeshService(
         publishPeers()
     }
 
-    @Synchronized
-    private fun stopIfCurrent(udp: DatagramSocket) { if (socket === udp) stopTransport() }
-
     private fun acquireMulticastLock() {
         _maySleep.value = true
         try {
@@ -376,42 +454,91 @@ class MeshService(
         } catch (_: Exception) { _maySleep.value = true }
     }
 
-    private suspend fun announceLoop(udp: DatagramSocket) {
+    private fun announcement(): JSONObject = JSONObject().put("t", "announce").put("name", config.name)
+        .put("role", config.role).put("priority", config.priority).put("port", config.port)
+        .put("tcp_port", config.port).put("platform", "android")
+        .put("services", JSONArray(HomeLink.operations.toList()))
+        .put("coordination_version", HomeCoordination.VERSION).put("secure_version", SecureHome.VERSION)
+
+    private suspend fun announceLoop(owner: Job) {
         while (currentCoroutineContext().isActive) {
-            synchronized(this) {
-                if (socket !== udp) return
-                send(udp, JSONObject().put("t", "announce").put("name", config.name).put("role", config.role)
-                    .put("priority", config.priority).put("port", config.port).put("platform", "android")
-                    .put("services", JSONArray(HomeLink.operations.toList()))
-                    .put("coordination_version", HomeCoordination.VERSION).put("secure_version", SecureHome.VERSION))
+            withTimeoutOrNull(ANNOUNCE_INTERVAL_MS) { discovery.receive() }
+            val snapshot = synchronized(this) {
+                if (lifecycle !== owner) return
                 publishPeers()
+                val udp = socket ?: return@synchronized null
+                val member = credentials ?: return@synchronized null
+                val payload = HomeLink.encode(member, config.id, session, announcement()) ?: return@synchronized null
+                Triple(udp, payload, config to peers.values.toList())
+            } ?: continue
+            val (udp, payload, destinations) = snapshot
+            val (settings, knownPeers) = destinations
+            val targets = linkedSetOf("255.255.255.255")
+            try {
+                val interfaces = NetworkInterface.getNetworkInterfaces()
+                while (interfaces != null && interfaces.hasMoreElements()) {
+                    val iface = interfaces.nextElement()
+                    if (!iface.isUp || iface.isLoopback) continue
+                    iface.interfaceAddresses.forEach { address ->
+                        (address.broadcast as? Inet4Address)?.hostAddress?.let { targets.add(it) }
+                    }
+                }
+            } catch (_: Exception) {
+                // Global broadcast and explicit seeds remain available if interface enumeration fails.
             }
-            delay(ANNOUNCE_INTERVAL_MS)
+            targets.addAll(settings.seeds)
+            val endpoints = targets.map { it to settings.port }.toMutableSet()
+            // Broadcast may be filtered after seed bootstrap; sustain mutual presence by unicast.
+            knownPeers.forEach { endpoints.add(it.host to it.port) }
+            for ((target, port) in endpoints) {
+                if (!currentCoroutineContext().isActive ||
+                    !synchronized(this) { lifecycle === owner && socket === udp && !udp.isClosed }) break
+                try {
+                    // Resolve all IPv4 addresses: localhost/dual-stack names must not hide LAN IPv4.
+                    InetAddress.getAllByName(target).filterIsInstance<Inet4Address>().forEach { address ->
+                        if (!currentCoroutineContext().isActive ||
+                            !synchronized(this) { lifecycle === owner && socket === udp && !udp.isClosed }) return@forEach
+                        udp.send(DatagramPacket(payload, payload.size, address, port))
+                    }
+                } catch (_: Exception) {
+                    // A failed route/seed must not suppress other interfaces or stop discovery.
+                }
+            }
         }
+    }
+
+    private fun dispatch(udp: DatagramSocket, payload: ByteArray, length: Int, host: String) {
+        val work = synchronized(this) {
+            if (socket !== udp || udp.isClosed || lifecycle?.isActive != true || length !in 1..HomeLink.MAX_PACKET) return
+            val member = credentials ?: return
+            val message = HomeLink.decode(member, payload, length) ?: return
+            handle(udp, message, host)
+        }
+        work?.start() // No application callback under the mesh monitor, on either transport.
     }
 
     private suspend fun receiveLoop(udp: DatagramSocket) {
         val buffer = ByteArray(HomeLink.MAX_PACKET + 1)
+        var receiveErrors = 0
         while (currentCoroutineContext().isActive) {
             try {
                 val packet = DatagramPacket(buffer, buffer.size)
                 udp.receive(packet)
+                receiveErrors = 0
                 if (packet.length == 0 || packet.length > HomeLink.MAX_PACKET) continue
-                val work = synchronized(this) {
-                    if (socket !== udp) return
-                    val member = credentials ?: return
-                    val message = HomeLink.decode(member, packet.data, packet.length)
-                    if (message == null) null else handle(udp, message, packet.address.hostAddress ?: "")
-                }
-                // The callback job is dispatched only after releasing the mesh monitor.
-                work?.start()
+                dispatch(udp, packet.data, packet.length, packet.address.hostAddress.orEmpty())
+                synchronized(this) { if (socket === udp) _error.value = "" }
             } catch (_: java.net.SocketTimeoutException) {
                 continue
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: java.io.IOException) {
                 synchronized(this) { if (socket === udp) _error.value = "Сеть дома недоступна." }
-                return
+                if (udp.isClosed) return
+                // Isolated ICMP does not kill transport. Rebind persistent failures without clearing
+                // our session, replay history or executed IDs (otherwise side effects could repeat).
+                if (++receiveErrors >= 4) { udp.close(); return }
+                delay(250)
             } catch (_: Exception) {
                 // Invalid/untrusted datagrams must not terminate the service.
             }
@@ -432,6 +559,9 @@ class MeshService(
             val role = body.opt("role") as? String ?: return null
             val priority = HomeLink.integer(body, "priority") ?: return null
             val port = HomeLink.integer(body, "port") ?: return null
+            val tcpPort = if (body.has("tcp_port")) {
+                HomeLink.integer(body, "tcp_port")?.takeIf { it in 1024..65_535 } ?: return null
+            } else null
             val platform = body.opt("platform") as? String ?: return null
             val servicesJson = body.opt("services") as? JSONArray ?: return null
             if (!HomeLink.validText(name, 128) || !HomeLink.validText(role, 32) || priority !in 0..100 ||
@@ -443,6 +573,7 @@ class MeshService(
                 (message.id to message.session) in retiredSessions) return null
             prunePeers()
             if (!peers.containsKey(message.id) && peers.size >= MAX_PEERS) return null
+            val newlySeen = !peers.containsKey(message.id)
             val previousSession = announcedSessions[message.id]
             if (previousSession == null && announcedSessions.size >= MAX_HISTORY) return null
             if (previousSession != null && previousSession != message.session) {
@@ -455,7 +586,12 @@ class MeshService(
             peers[message.id] = MeshNode(message.id, name, role, priority, host, port, now,
                 session = message.session, platform = platform, services = services,
                 coordinationVersion = HomeLink.integer(body, "coordination_version")?.takeIf { it == HomeCoordination.VERSION } ?: 0,
-                secureVersion = HomeLink.integer(body, "secure_version")?.takeIf { it == SecureHome.VERSION } ?: 0)
+                secureVersion = HomeLink.integer(body, "secure_version")?.takeIf { it == SecureHome.VERSION } ?: 0,
+                tcpPort = tcpPort)
+            if (newlySeen || previousSession != message.session) {
+                // Bootstrap mutual presence once, not a reply storm for every heartbeat.
+                send(udp, announcement(), peers[message.id], discoveryOnly = true)
+            }
             publishPeers()
             return null
         }
@@ -492,38 +628,44 @@ class MeshService(
                     }
                     val childScope = workers ?: return null
                     val ourSession = session
+                    val expiresAt = android.os.SystemClock.elapsedRealtime() + REQUEST_TIMEOUT_MS
                     inflight++
                     val requestJob = childScope.launch(start = CoroutineStart.LAZY) {
-                        try {
-                            val valid = synchronized(this@MeshService) {
-                                socket === udp && session == ourSession && peers[peer.id]?.let {
-                                    it.session == peer.session && it.online()
-                                } == true
-                            }
-                            if (!valid) return@launch
-                            val result = try {
-                                withTimeoutOrNull(REQUEST_TIMEOUT_MS) {
-                                    normalize(if (operation == "catalog" && args.has("coordination")) {
-                                        coordination.handle(args)
-                                    } else {
-                                        onRequest(operation, args, peer.id, peer.session)
-                                    })
-                                } ?: failure("Remote request timed out", "unknown")
-                            } catch (cancelled: CancellationException) { throw cancelled }
-                            catch (_: Exception) { failure("Remote request failed") }
-                            synchronized(this@MeshService) {
-                                if (socket === udp && session == ourSession && peers[peer.id]?.session == peer.session) {
-                                    if (!sendResult(udp, peer, id, operation, result)) {
-                                        sendResult(udp, peer, id, operation, failure("Remote result unavailable"))
-                                    }
+                        val valid = synchronized(this@MeshService) {
+                            lifecycle?.isActive == true && session == ourSession && peers[peer.id]?.let {
+                                it.session == peer.session && it.online()
+                            } == true
+                        }
+                        if (!valid) return@launch
+                        val result = try {
+                            withTimeoutOrNull((expiresAt - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L)) {
+                                normalize(if (operation == "catalog" && args.has("coordination")) {
+                                    coordination.handle(args)
+                                } else {
+                                    onRequest(operation, args, peer.id, peer.session)
+                                })
+                            } ?: failure("Remote request timed out", "unknown")
+                        } catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { failure("Remote request failed") }
+                        synchronized(this@MeshService) {
+                            // A socket rebind is not a membership/session change. Reply on the live route.
+                            val currentSocket = socket
+                            val currentPeer = peers[peer.id]
+                            if (currentSocket != null && session == ourSession &&
+                                currentPeer?.session == peer.session && currentPeer.online()) {
+                                if (!sendResult(currentSocket, currentPeer, id, operation, result)) {
+                                    sendResult(currentSocket, currentPeer, id, operation, failure("Remote result unavailable"))
                                 }
                             }
-                        } finally {
-                            synchronized(this@MeshService) { if (session == ourSession) inflight-- }
                         }
                     }
                     inbound[requestJob] = peer.id to peer.session
-                    requestJob.invokeOnCompletion { synchronized(this@MeshService) { inbound.remove(requestJob) } }
+                    // A lazy job can be cancelled before its body (and its finally) ever runs.
+                    requestJob.invokeOnCompletion {
+                        synchronized(this@MeshService) {
+                            if (inbound.remove(requestJob) != null && session == ourSession) inflight--
+                        }
+                    }
                     return requestJob
                 }
             }
@@ -568,15 +710,16 @@ class MeshService(
         }
         val childScope = workers ?: return null
         val ourSession = session
+        val expiresAt = android.os.SystemClock.elapsedRealtime() + opened.timeoutMs
         val requestJob = childScope.launch(start = CoroutineStart.LAZY) {
             val valid = synchronized(this@MeshService) {
-                socket === udp && session == ourSession && peers[peer.id]?.let {
+                lifecycle?.isActive == true && session == ourSession && peers[peer.id]?.let {
                     it.session == peer.session && it.online()
                 } == true
             }
             if (!valid) return@launch
             val result = try {
-                withTimeoutOrNull(opened.timeoutMs) {
+                withTimeoutOrNull((expiresAt - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L)) {
                     val value = handler(operation, args, peer.id, peer.session)
                     try { SecureHome.snapshot(normalize(value)) }
                     catch (_: Exception) { SecureHome.failure("Secure result exceeds payload or JSON limits") }
@@ -584,9 +727,12 @@ class MeshService(
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (_: Exception) { SecureHome.failure("Secure handler failed") }
             synchronized(this@MeshService) {
-                if (socket === udp && session == ourSession && peers[peer.id]?.session == peer.session) {
-                    if (!sendSecureResult(udp, peer, opened.id, opened.timeoutMs, result)) {
-                        sendSecureResult(udp, peer, opened.id, opened.timeoutMs, SecureHome.failure("Secure result could not be sent"))
+                val currentSocket = socket
+                val currentPeer = peers[peer.id]
+                if (currentSocket != null && session == ourSession &&
+                    currentPeer?.session == peer.session && currentPeer.online()) {
+                    if (!sendSecureResult(currentSocket, currentPeer, opened.id, opened.timeoutMs, result)) {
+                        sendSecureResult(currentSocket, currentPeer, opened.id, opened.timeoutMs, SecureHome.failure("Secure result could not be sent"))
                     }
                 }
             }
@@ -604,7 +750,7 @@ class MeshService(
         } catch (_: Exception) { false }
     }
 
-    /** Single datagram, no retries. Timeout/cancellation after send means outcome is unknown.
+    /** Single authenticated frame (legacy UDP if unadvertised), no retries. Timeout/cancellation after send means outcome is unknown.
      * Complete plaintext JSON is capped at 8192 UTF-8 bytes; no truncation/fragmentation.
      * Requires a fresh announcement with secure_version=1; never falls back to cleartext RPC.
      */
@@ -615,6 +761,8 @@ class MeshService(
         val payload = try { SecureHome.snapshot(JSONObject().put("op", operation).put("args", args)) }
             catch (_: Exception) { return@withContext SecureHome.failure("Secure request exceeds payload or JSON limits (8192 bytes)") }
         val id = HomeLink.uuid()
+        val caller = currentCoroutineContext()[Job]
+        val expiresAt = android.os.SystemClock.elapsedRealtime() + timeoutMs
         val deferred = CompletableDeferred<JSONObject>()
         val wait = synchronized(this@MeshService) {
             ensureLoaded()
@@ -629,7 +777,7 @@ class MeshService(
             val body = try { SecureHome.seal(member, config.id, session, peer.id, peer.session,
                 id, "secure_request", timeoutMs, payload) }
                 catch (_: Exception) { return@withContext SecureHome.failure("Secure request encryption failed") }
-            val value = SecurePending(peer.id, peer.session, timeoutMs, deferred)
+            val value = SecurePending(peer.id, peer.session, timeoutMs, deferred, caller, expiresAt)
             securePending[id] = value
             if (!send(udp, body, peer)) {
                 securePending.remove(id)
@@ -638,7 +786,7 @@ class MeshService(
             value
         }
         try {
-            withTimeoutOrNull(timeoutMs) { deferred.await() }
+            withTimeoutOrNull((expiresAt - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L)) { deferred.await() }
                 ?: SecureHome.failure("Secure request timed out; outcome unknown")
         } finally {
             synchronized(this@MeshService) { if (securePending[id] === wait) securePending.remove(id) }
@@ -661,6 +809,8 @@ class MeshService(
     suspend fun request(nodeId: String, operation: String, args: JSONObject = JSONObject()): JSONObject = withContext(Dispatchers.IO) {
         if (operation !in HomeLink.operations) return@withContext failure("Unsupported operation")
         val id = HomeLink.uuid()
+        val caller = currentCoroutineContext()[Job]
+        val expiresAt = android.os.SystemClock.elapsedRealtime() + REQUEST_TIMEOUT_MS
         val deferred = CompletableDeferred<JSONObject>()
         val wait = synchronized(this@MeshService) {
             ensureLoaded()
@@ -671,7 +821,7 @@ class MeshService(
             }
             if (operation !in peer.services) return@withContext failure("Operation unavailable")
             if (pending.size >= MAX_WORK) return@withContext failure("Too many pending requests")
-            val value = Pending(peer.id, peer.session, operation, deferred)
+            val value = Pending(peer.id, peer.session, operation, deferred, caller, expiresAt)
             pending[id] = value
             val sent = send(udp, JSONObject().put("t", "request").put("to", peer.id)
                 .put("to_session", peer.session).put("request_id", id).put("op", operation).put("args", args), peer)
@@ -682,7 +832,7 @@ class MeshService(
             value
         }
         try {
-            withTimeoutOrNull(REQUEST_TIMEOUT_MS) { deferred.await() } ?: failure("Request timed out", "unknown")
+            withTimeoutOrNull((expiresAt - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L)) { deferred.await() } ?: failure("Request timed out", "unknown")
         } finally {
             synchronized(this@MeshService) { if (pending[id] === wait) pending.remove(id) }
         }
@@ -694,6 +844,7 @@ class MeshService(
         }
 
     private fun failPending(peerId: String) {
+        inbound.filterValues { it.first == peerId }.keys.toList().forEach { it.cancel() }
         val secureIds = securePending.filterValues { it.peer == peerId }.keys.toList()
         secureIds.forEach { securePending.remove(it)?.result?.complete(
             SecureHome.failure("Peer session changed or unavailable; outcome unknown")) }
@@ -711,20 +862,52 @@ class MeshService(
         prunePeers()
         val self = MeshNode(config.id, config.name, config.role, config.priority, "—", config.port,
             System.currentTimeMillis(), self = true, session = session, services = HomeLink.operations.toList(),
-            coordinationVersion = HomeCoordination.VERSION, secureVersion = SecureHome.VERSION)
+            coordinationVersion = HomeCoordination.VERSION, secureVersion = SecureHome.VERSION, tcpPort = config.port)
         _nodes.value = listOf(self) + peers.values.sortedByDescending { it.priority }
     }
 
-    /** All sends run on IO workers, serialized with membership changes. */
-    private fun send(udp: DatagramSocket, body: JSONObject, peer: MeshNode? = null): Boolean {
+    /** Under mesh monitor; deferred activity alone does not reflect caller cancellation/expiry. */
+    private fun requestCurrent(kind: String, id: String): Boolean = when (kind) {
+        "request" -> pending[id]?.let {
+            it.result.isActive && it.caller?.isActive != false &&
+                android.os.SystemClock.elapsedRealtime() < it.expiresAt
+        } == true
+        "secure_request" -> securePending[id]?.let {
+            it.result.isActive && it.caller?.isActive != false &&
+                android.os.SystemClock.elapsedRealtime() < it.expiresAt
+        } == true
+        else -> true
+    }
+
+    /** Under mesh monitor. TCP is bounded/queued; never retry an uncertain send over UDP. */
+    private fun send(udp: DatagramSocket, body: JSONObject, peer: MeshNode? = null,
+        discoveryOnly: Boolean = false): Boolean {
         if (socket !== udp || udp.isClosed || lifecycle?.isActive != true) return false
         val member = credentials ?: return false
-        return runCatching {
+        val kind = body.optString("t")
+        val requestId = body.optString("request_id")
+        if (!requestCurrent(kind, requestId)) return false
+        return try {
             val payload = HomeLink.encode(member, config.id, session, body) ?: return false
-            val address = InetAddress.getByName(peer?.host ?: "255.255.255.255")
-            udp.send(DatagramPacket(payload, payload.size, address, peer?.port ?: config.port))
-            true
-        }.getOrDefault(false)
+            if (peer != null && peer.tcpPort != null && !discoveryOnly) {
+                val generation = session
+                reliable?.send(peer.host, peer.tcpPort, payload) {
+                    synchronized(this@MeshService) {
+                        socket === udp && session == generation &&
+                            peers[peer.id]?.let {
+                                it.session == peer.session && it.host == peer.host &&
+                                    it.tcpPort == peer.tcpPort && it.online()
+                            } == true &&
+                            requestCurrent(kind, requestId)
+                    }
+                } == true
+            } else {
+                val address = InetAddress.getByName(peer?.host ?: "255.255.255.255")
+                if (!requestCurrent(kind, requestId)) return false
+                udp.send(DatagramPacket(payload, payload.size, address, peer?.port ?: config.port))
+                true
+            }
+        } catch (_: Exception) { false }
     }
 
     /** Diagnostic integration probe. One coordinator obtains fresh peer samples for a shared round. */

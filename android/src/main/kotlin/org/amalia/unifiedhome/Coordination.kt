@@ -68,7 +68,12 @@ interface HomeVoiceCoordinator {
 
 /** Narrow, public extension of catalog RPC, compatible with v2's fixed operation allowlist. */
 class HomeCoordination internal constructor(private val mesh: MeshService) : HomeVoiceCoordinator {
-    companion object { const val VERSION = 1; private const val SAMPLE_TTL = 2_000L }
+    companion object {
+        const val VERSION = 1
+        private const val SAMPLE_TTL = 2_000L
+        // Includes mutex wait + settle + peer RPC; leaves 250ms for host handoff.
+        private const val ROUND_TIMEOUT = 800L
+    }
     private data class Sample(val score: Double, val at: Long)
     private data class SceneRef(val id: String, val node: String, val scene: String, val dependencies: List<String>)
     private data class Dispatch(val expires: Long, val home: String, val session: String,
@@ -86,7 +91,9 @@ class HomeCoordination internal constructor(private val mesh: MeshService) : Hom
     private val executionSlots = Semaphore(4)
 
     internal fun attach(home: HomeEngine) { engine = home }
-    internal fun setVoiceHookEnabled(enabled: Boolean) { voiceHookEnabled = enabled }
+    internal fun setVoiceHookEnabled(enabled: Boolean) {
+        if (voiceHookEnabled != enabled) { voiceHookEnabled = enabled; clear() }
+    }
     internal fun clear() {
         generation++
         sample = null
@@ -104,7 +111,17 @@ class HomeCoordination internal constructor(private val mesh: MeshService) : Hom
     private fun unavailable(reason: String) = JSONObject().put("ok", false).put("data", JSONObject())
         .put("error", reason)
 
-    fun preferences(): JSONObject = mesh.settings.coordination.toJson()
+    fun preferences(): JSONObject {
+        val configured = mesh.settings.coordination
+        val roles = configured.roles.filter { role ->
+            when (role) {
+                "listener", "responder" -> voiceHookEnabled
+                "executor" -> engine != null
+                else -> true
+            }
+        }.toSet()
+        return configured.copy(roles = roles).toJson()
+    }
     fun updatePreferences(json: JSONObject): JSONObject = mesh.updateCoordination(CoordinationPreferences.fromJson(json)).toJson()
 
     /** Explicitly public metadata only; never device states, bridge endpoints, audit or conversation. */
@@ -149,11 +166,38 @@ class HomeCoordination internal constructor(private val mesh: MeshService) : Hom
     }
 
     /** One deterministic coordinator and one shared round: peers supply their OWN fresh measurements. */
+    private fun liveNodes(): List<MeshNode> = mesh.nodes.value.filter { it.online() }.sortedBy { it.id }
+
+    private fun voiceView(nodes: List<MeshNode>): String = JSONArray()
+        .put(mesh.membership().optString("home_id")).put(generation).put(mesh.settings.coordination.toJson())
+        .put(JSONArray(nodes.map { node -> JSONArray().put(node.id).put(node.session)
+            .put(node.coordinationVersion).put(node.priority).put(JSONArray(node.services.sorted())) })).toString()
+
     override suspend fun arbitrate(roundId: String): JSONObject {
         require(HomeLink.validUuid(roundId))
-        val leader = mesh.nodes.value.filter { it.online() && (it.self || it.coordinationVersion == VERSION) }
-            .minByOrNull { it.id } ?: return unavailable("No coordinator")
-        return if (leader.self) resolveRound(roundId) else rpc(leader.id, "arbitrate", roundId)
+        return withTimeoutOrNull(ROUND_TIMEOUT) {
+            val nodes = liveNodes()
+            if (!mesh.running || nodes.isEmpty() || nodes.any { it.coordinationVersion != VERSION }) {
+                return@withTimeoutOrNull unavailable("Coordinator unavailable; do not answer")
+            }
+            val leader = nodes.first()
+            val view = voiceView(nodes)
+            val started = android.os.SystemClock.elapsedRealtime()
+            val result = if (leader.self) resolveRound(roundId) else rpc(leader.id, "arbitrate", roundId)
+            val data = result.optJSONObject("data")
+            val elapsed = android.os.SystemClock.elapsedRealtime() - started
+            if (!mesh.running || voiceView(liveNodes()) != view || !result.optBoolean("ok") || data == null ||
+                data.optString("coordinator") != leader.id || data.optInt("participants") != nodes.size ||
+                !HomeLink.validUuid(data.optString("round")) || data.optLong("lease_ms") !in (elapsed + 1)..2_000L) {
+                return@withTimeoutOrNull unavailable("Invalid or expired voice decision; do not answer")
+            }
+            val routing = data.optJSONObject("routing")
+                ?: return@withTimeoutOrNull unavailable("Invalid voice routing; do not answer")
+            if (CoordinationPreferences.ROLE_NAMES.any { role ->
+                    !routing.has(role) || (!routing.isNull(role) && nodes.none { it.id == routing.optString(role) })
+                }) return@withTimeoutOrNull unavailable("Invalid voice target; do not answer")
+            JSONObject(result.toString()).apply { getJSONObject("data").put("lease_ms", data.getLong("lease_ms") - elapsed) }
+        } ?: unavailable("Voice round timed out; do not answer")
     }
 
     /** Only the actual host wake callback may label a decision as controlling a voice turn.
@@ -176,13 +220,17 @@ class HomeCoordination internal constructor(private val mesh: MeshService) : Hom
         return result
     }
 
-    private suspend fun resolveRound(round: String): JSONObject = roundLock.withLock {
+    private suspend fun resolveRound(round: String): JSONObject = withTimeoutOrNull(ROUND_TIMEOUT) {
+        resolveRoundWithLock(round)
+    } ?: unavailable("Voice round timed out; do not answer")
+
+    private suspend fun resolveRoundWithLock(round: String): JSONObject = roundLock.withLock {
         require(HomeLink.validUuid(round))
-        val nodes = mesh.nodes.value.filter { it.online() && (it.self || it.coordinationVersion == VERSION) }
-        if (nodes.minByOrNull { it.id }?.self != true) return@withLock unavailable("Coordinator changed; do not answer")
+        val nodes = liveNodes()
+        if (!mesh.running || nodes.any { it.coordinationVersion != VERSION } || nodes.firstOrNull()?.self != true) return@withLock unavailable("Coordinator changed; do not answer")
         val session = nodes.first { it.self }.session
         val startGeneration = generation
-        val view = "$session:$startGeneration:" + nodes.sortedBy { it.id }.joinToString("|") { "${it.id}:${it.session}" }
+        val view = voiceView(nodes)
         val key = "$view:$round"
         val now = android.os.SystemClock.elapsedRealtime()
         rounds.entries.removeAll { now - it.value.first > 30_000 }
@@ -204,25 +252,36 @@ class HomeCoordination internal constructor(private val mesh: MeshService) : Hom
         // Settle independent wake detections before reading proximity. This suspend
         // delay holds only the election mutex, never the host's audio mutex.
         delay(150L)
-        val samples = withTimeoutOrNull(900) { coroutineScope {
+        val samples = withTimeoutOrNull(ROUND_TIMEOUT - 150L) { coroutineScope {
             nodes.map { node -> async {
-                val response = if (node.self) ok(JSONObject().put("preferences", preferences())
+                val response = if (node.self) ok(JSONObject().put("round", round).put("preferences", preferences())
                     .put("score", currentScore() ?: JSONObject.NULL)) else rpc(node.id, "sample", round)
                 node to response
             } }.awaitAll()
         } } ?: return@withLock unavailable("Voice round timed out; do not answer")
-        // A missing eligible peer could be the manual target. Fail closed instead of making two speakers.
-        if (generation != startGeneration || samples.any { !it.second.optBoolean("ok") } || mesh.nodes.value.firstOrNull { it.self }?.session != session ||
-            nodes.any { original -> mesh.nodes.value.none { it.id == original.id && it.session == original.session && it.online() } } ||
-            mesh.nodes.value.filter { it.online() && (it.self || it.coordinationVersion == VERSION) }.minByOrNull { it.id }?.self != true) {
+        // Compare the COMPLETE membership, including newly arrived and legacy peers.
+        if (!mesh.running || generation != startGeneration || voiceView(liveNodes()) != view ||
+            mesh.nodes.value.firstOrNull { it.self }?.session != session) {
+            return@withLock unavailable("Voice session changed; do not answer")
+        }
+        try {
+            samples.forEach { (_, reply) ->
+                require(reply.optBoolean("ok"))
+                val data = reply.getJSONObject("data")
+                require(data.getString("round") == round)
+                CoordinationPreferences.fromJson(data.getJSONObject("preferences"))
+                val score = data.opt("score")
+                require(score == JSONObject.NULL || (score is Number && score.toDouble().isFinite() && score.toDouble() in 0.0..100.0))
+            }
+        } catch (_: Exception) {
             return@withLock unavailable("Incomplete voice round; do not answer")
         }
-        val prefs = mesh.settings.coordination
         val routing = JSONObject()
         for (role in CoordinationPreferences.ROLE_NAMES) {
             val candidates = samples.filter { (_, reply) ->
                 val roles = reply.optJSONObject("data")?.optJSONObject("preferences")?.optJSONArray("roles")
-                (0 until (roles?.length() ?: 0)).any { roles?.optString(it) == role }
+                (0 until (roles?.length() ?: 0)).any { roles?.optString(it) == role } &&
+                    (role !in setOf("listener", "responder") || reply.getJSONObject("data").opt("score") is Number)
             }
             val manualTargets = samples.mapNotNull { (_, reply) ->
                 val settings = reply.optJSONObject("data")?.optJSONObject("preferences")
@@ -230,16 +289,11 @@ class HomeCoordination internal constructor(private val mesh: MeshService) : Hom
             }.distinct()
             // A manual selection made on any phone must beat acoustic proximity.
             // Conflicting explicit selections fail closed instead of choosing arbitrarily.
-            val target = if (prefs.mode == "manual" && prefs.target(role).isNotEmpty()) prefs.target(role)
-                else manualTargets.singleOrNull().orEmpty()
-            val chosen = if (manualTargets.size > 1 && target.isEmpty()) null else if (target.isNotEmpty()) {
+            val target = manualTargets.singleOrNull().orEmpty()
+            val chosen = if (manualTargets.size > 1) null else if (target.isNotEmpty()) {
                 candidates.firstOrNull { it.first.id == target }
             } else {
-                candidates.filter { role !in setOf("listener", "responder") ||
-                    (it.second.optJSONObject("data")?.opt("score") as? Number)?.toDouble()?.let { score ->
-                        score.isFinite() && score in 0.0..100.0
-                    } == true }
-                    .maxWithOrNull(compareBy<Pair<MeshNode, JSONObject>> {
+                candidates.maxWithOrNull(compareBy<Pair<MeshNode, JSONObject>> {
                         if (role in setOf("listener", "responder")) it.second.getJSONObject("data").getDouble("score") else 0.0
                     }.thenBy { it.first.priority }.thenBy { it.first.id })
             }
@@ -258,7 +312,7 @@ class HomeCoordination internal constructor(private val mesh: MeshService) : Hom
     suspend fun planScenes(raw: JSONArray): JSONObject = withContext(Dispatchers.IO) {
         require(raw.length() in 1..64) { "Expected 1 to 64 scenes" }
         val home = engine ?: return@withContext unavailable("Home unavailable")
-        dispatches.entries.removeAll { it.value.expires <= System.currentTimeMillis() }
+        dispatches.entries.removeAll { it.value.expires <= android.os.SystemClock.elapsedRealtime() }
         require(dispatches.size < 32) { "Too many pending dispatches" }
         val startGeneration = generation
         val startHome = mesh.membership().optString("home_id")
@@ -316,7 +370,7 @@ class HomeCoordination internal constructor(private val mesh: MeshService) : Hom
                     it.id == ref.node && it.session == session && it.online()
                 }) return@withContext unavailable("Node or home session changed during planning; nothing applied")
             // Count validity from BEFORE the request, not from the end of all planning.
-            val requestedAt = System.currentTimeMillis()
+            val requestedAt = android.os.SystemClock.elapsedRealtime()
             val plan = if (ref.node == mesh.nodeId) home.planScene(ref.scene)?.toJson() else {
                 val response = mesh.request(ref.node, "plan_scene", JSONObject().put("scene", ref.scene))
                 if (response.optBoolean("ok")) response.optJSONObject("data") else null
@@ -341,7 +395,7 @@ class HomeCoordination internal constructor(private val mesh: MeshService) : Hom
                 "Overlapping scenes must be combined into one scene before planning"
             }
         }
-        require(expires > System.currentTimeMillis()) { "A scene plan expired during planning" }
+        require(expires > android.os.SystemClock.elapsedRealtime()) { "A scene plan expired during planning" }
         require(unchanged() && sessions.all { (node, session) -> mesh.nodes.value.any {
             it.id == node && it.session == session && it.online()
         } }) { "Home or node session changed during planning" }
@@ -351,7 +405,7 @@ class HomeCoordination internal constructor(private val mesh: MeshService) : Hom
         val token = newId("dispatch")
         dispatches[token] = Dispatch(expires, startHome, startSession, startGeneration, previews)
         ok(JSONObject().put("token", token).put("plans", JSONArray(previews.map { JSONObject(it.toString()).apply { remove("session") } }))
-            .put("expires_at", expires).put("atomic", false).put("requires_confirmation", true))
+            .put("expires_at", System.currentTimeMillis() + expires - android.os.SystemClock.elapsedRealtime()).put("atomic", false).put("requires_confirmation", true))
     }
 
     private fun confirmed(result: JSONObject): Boolean = result.optBoolean("ok") &&
@@ -364,7 +418,7 @@ class HomeCoordination internal constructor(private val mesh: MeshService) : Hom
         fun dispatchProblem(row: JSONObject): String? = when {
             generation != dispatch.generation || dispatch.home != mesh.membership().optString("home_id") ||
                 dispatch.session != mesh.nodes.value.firstOrNull { it.self }?.session.orEmpty() -> "Home session changed"
-            dispatch.expires <= System.currentTimeMillis() -> "Plan deadline expired"
+            dispatch.expires <= android.os.SystemClock.elapsedRealtime() -> "Plan deadline expired"
             mesh.nodes.value.none { it.id == row.getString("node") && it.online() &&
                 it.session == row.getString("session") } -> "Node session changed or unavailable"
             else -> null

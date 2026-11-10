@@ -1,5 +1,9 @@
 # Amalia Home LAN protocol v2 — implementation contract
 
+**Transport/settings update (2026-11-09):** [LAN_RELIABILITY.md](LAN_RELIABILITY.md)
+adds framed TCP RPC, recoverable discovery, 45-second presence and encrypted,
+locally approved settings offers; it supersedes older transport limitations below.
+
 All peers explicitly join one household using a 256-bit shared secret. No legacy/v1 fallback. Creating/joining/leaving a home is a **local human action**, not an LLM tool. Invite format `amalia-home:v2:<home UUID hex 32>:<key hex 64>`. Never publish/log the invite/key in discovery, tools, ordinary config/status or errors. Shared-key membership gives every member equal authority; removal requires a new home/key and rejoining remaining devices. HMAC authenticates but does **not encrypt** LAN traffic; keep secrets/audio/dialog history out of packets.
 
 UDP default 47654; max datagram 16384 bytes. Announcement every 5 sec, TTL 15 sec. Household does not exist until explicitly created/joined. Node IDs are durable; session is a fresh UUID hex on service restart AND membership change.

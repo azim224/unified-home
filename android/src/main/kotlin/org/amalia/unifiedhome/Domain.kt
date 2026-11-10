@@ -710,7 +710,7 @@ fun matches(desired: Map<String, Any?>, actual: Map<String, Any?>, tolerance: Do
         val gotNumber = (got as? Number)?.toDouble()
         if (expectedNumber != null && gotNumber != null) {
             if (!expectedNumber.isFinite() || !gotNumber.isFinite()) return false
-            val allowed = when (key) {
+            val allowed = if (tolerance == 0.0) 0.0 else when (key) {
                 "temperature" -> 0.5
                 "color_temp" -> 100.0
                 else -> tolerance

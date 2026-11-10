@@ -21,36 +21,50 @@ import org.json.JSONObject
 /** Application-level routing shared by phones: no desktop, server or cloud relay required.
  * Private operations use only the encrypted household channel and local opt-in grants.
  */
-class HomeRouting(private val home: HomeEngine, private val host: HostServices) {
+class HomeRouting(private val home: HomeEngine, private val host: HostServices, private val settingsTransfer: HomeSettingsTransfer? = null) {
     private val mutex = Mutex()
     private val completed = LinkedHashMap<String, Pair<Long, JSONObject>>()
 
     private fun failure(reason: String) = JSONObject().put("ok", false).put("data", JSONObject()).put("error", reason)
     private fun ok(data: JSONObject) = JSONObject().put("ok", true).put("data", data).put("error", "")
 
-    private suspend fun <T> granted(key: String, block: suspend () -> T): T = coroutineScope {
+    private suspend fun <T> granted(key: String, from: String, session: String, block: suspend () -> T): T = coroutineScope {
         val generation = home.sharing.generation
-        check(home.sharing.snapshot().optBoolean(key)) { "Grant unavailable" }
+        val household = home.mesh.membership().optString("home_id")
+        val receiver = home.mesh.nodes.value.firstOrNull { it.self }?.session
+        fun current(): Boolean = generation == home.sharing.generation &&
+            home.sharing.snapshot().optBoolean(key) && home.mesh.running &&
+            home.mesh.membership().optBoolean("joined") &&
+            household == home.mesh.membership().optString("home_id") &&
+            receiver == home.mesh.nodes.value.firstOrNull { it.self }?.session &&
+            home.mesh.nodes.value.any { it.id == from && it.session == session && it.online() }
+        check(current()) { "Grant or peer session unavailable" }
         val task = async { block() }
         val guard = launch {
             while (task.isActive) {
                 delay(50)
-                if (generation != home.sharing.generation || !home.sharing.snapshot().optBoolean(key)) {
+                if (!current()) {
                     task.cancel(CancellationException("Local sharing grant withdrawn"))
                     break
                 }
             }
         }
-        try { task.await() } finally { guard.cancel() }
+        try {
+            val result = task.await()
+            check(current()) { "Grant or peer session changed; outcome unknown; no retry" }
+            result
+        } finally { guard.cancel() }
     }
 
     private fun boundedReply(text: String): String {
+        val notice = "\n[Ответ сокращён из-за размера сетевого сообщения.]"
         var end = text.length
-        while (JSONObject().put("reply", text.substring(0, end)).toString().toByteArray(Charsets.UTF_8).size > 6_000) {
+        fun reply(): String = text.substring(0, end) + if (end < text.length) notice else ""
+        while (JSONObject().put("reply", reply()).toString().toByteArray(Charsets.UTF_8).size > 6_000) {
             end = (end - 128).coerceAtLeast(0)
             if (end > 0 && text[end - 1].isHighSurrogate()) end--
         }
-        return if (end == text.length) text else text.substring(0, end) + "\n[Ответ сокращён из-за размера сетевого сообщения.]"
+        return reply()
     }
 
     /** Trim whole records, never split UTF-8 or malformed JSON. Truncation is explicit. */
@@ -74,12 +88,13 @@ class HomeRouting(private val home: HomeEngine, private val host: HostServices) 
             ?: return failure("Peer session unavailable")
         return try {
             when (operation) {
+                "settings_offer" -> settingsTransfer?.offer(args, from, session) ?: failure("Settings transfer unavailable")
                 "assistant_context" -> {
                     require(args.length() == 1 && args.opt("query") is String)
                     if (!home.sharing.snapshot().optBoolean("shareContext")) return failure("Context sharing is disabled locally")
                     val query = args.getString("query")
                     require(query.length in 1..512)
-                    val context = granted("shareContext") { compactContext(host.homeContext(query), 6_000) }
+                    val context = granted("shareContext", from, session) { compactContext(host.homeContext(query), 6_000) }
                     ok(JSONObject().put("node", home.mesh.nodeId).put("context", JSONObject(context)))
                 }
                 "assistant_respond" -> {
@@ -92,30 +107,41 @@ class HomeRouting(private val home: HomeEngine, private val host: HostServices) 
                     require(text.isNotBlank() && text.toByteArray(Charsets.UTF_8).size <= 3_000 && context.toByteArray(Charsets.UTF_8).size <= 4_000)
                     val revision = home.sharing.generation
                     val receiver = home.mesh.nodes.value.firstOrNull { it.self }?.session
-                    mutex.withLock {
-                        val now = System.currentTimeMillis()
+                    val household = home.mesh.membership().optString("home_id")
+                    val key = "$household:$receiver:$from:$session:$id"
+                    val previous = mutex.withLock {
+                        val now = android.os.SystemClock.elapsedRealtime()
                         completed.entries.removeAll { now - it.value.first > 120_000 }
-                        val key = "$from:$session:$id"
-                        completed[key]?.let { return@withLock JSONObject(it.second.toString()) }
-                        if (completed.size >= 128) return@withLock failure("Too many requests")
-                        // Reserve before calling the host: cancellation/unknown never permits blind replay.
-                        completed[key] = now to failure("Request already started; outcome unknown")
-                        if (revision != home.sharing.generation || !home.sharing.snapshot().optBoolean("allowBrain") ||
-                            receiver != home.mesh.nodes.value.firstOrNull { it.self }?.session) return@withLock failure("Grant or session changed")
-                        val response = granted("allowBrain") { host.homeRespond(id, text, context) }
-                        val bounded = boundedReply(response)
-                        val result = ok(JSONObject().put("reply", bounded).put("request_id", id)
-                            .put("reply_truncated", bounded != response))
-                        completed[key] = now to JSONObject(result.toString())
-                        result
+                        val cached = completed[key]
+                        if (cached != null) JSONObject(cached.second.toString())
+                        else if (completed.size >= 128) failure("Too many requests")
+                        else {
+                            // Reserve before host work. Never hold this lock while
+                            // awaiting the host: duplicate requests must not queue
+                            // behind a full turn and outlive their sender's deadline.
+                            completed[key] = now to failure("Request already started; outcome unknown")
+                            null
+                        }
                     }
+                    if (previous != null) return previous
+                    if (revision != home.sharing.generation || !home.sharing.snapshot().optBoolean("allowBrain") ||
+                        receiver != home.mesh.nodes.value.firstOrNull { it.self }?.session ||
+                        household != home.mesh.membership().optString("home_id")) return failure("Grant or session changed")
+                    val response = granted("allowBrain", from, session) { host.homeRespond(id, text, context) }
+                    val bounded = boundedReply(response)
+                    val result = ok(JSONObject().put("reply", bounded).put("request_id", id)
+                        .put("reply_truncated", bounded != response))
+                    mutex.withLock {
+                        completed[key] = android.os.SystemClock.elapsedRealtime() to JSONObject(result.toString())
+                    }
+                    result
                 }
                 "assistant_listen" -> {
                     require(args.length() == 1 && args.opt("request_id") is String)
                     if (!home.sharing.snapshot().optBoolean("allowListener")) return failure("Remote listening is disabled locally")
                     val id = args.getString("request_id")
                     require(HomeLink.validUuid(id))
-                    ok(JSONObject().put("listening_requested", granted("allowListener") { host.homeListen(id) }))
+                    ok(JSONObject().put("listening_requested", granted("allowListener", from, session) { host.homeListen(id) }))
                 }
                 "assistant_speak" -> {
                     require(args.length() == 2 && args.opt("request_id") is String && args.opt("text") is String)
@@ -123,7 +149,7 @@ class HomeRouting(private val home: HomeEngine, private val host: HostServices) 
                     val id = args.getString("request_id")
                     val text = args.getString("text")
                     require(HomeLink.validUuid(id) && text.isNotBlank() && text.toByteArray(Charsets.UTF_8).size <= 6_000)
-                    ok(JSONObject().put("spoken", granted("allowSpeaker") { host.homeSpeak(id, text) }).put("request_id", id))
+                    ok(JSONObject().put("spoken", granted("allowSpeaker", from, session) { host.homeSpeak(id, text) }).put("request_id", id))
                 }
                 else -> failure("Unsupported private operation")
             }
@@ -174,12 +200,25 @@ class HomeRouting(private val home: HomeEngine, private val host: HostServices) 
     /** Pure role resolution also works for typed requests without a wake election. */
     private suspend fun targets(): JSONObject {
         val nodes = home.mesh.nodes.value.filter { it.online() && (it.self || it.coordinationVersion == HomeCoordination.VERSION) }
-        val leader = nodes.minByOrNull { it.id } ?: return JSONObject()
+        val leader = nodes.minByOrNull { it.id }
+            ?: throw IllegalStateException("Coordinator unavailable; no silent local execution")
+        val household = home.mesh.membership().optString("home_id")
+        val session = home.mesh.nodes.value.firstOrNull { it.self }?.session
+        val localPreferences = home.mesh.coordination.preferences()
         val descriptor = home.mesh.coordination.discover(leader.id)
         val preferences = descriptor.optJSONObject("data")?.optJSONObject("preferences")
             ?: throw IllegalStateException("Coordinator unavailable; no silent local execution")
+        val currentLeader = home.mesh.nodes.value.filter {
+            it.online() && (it.self || it.coordinationVersion == HomeCoordination.VERSION)
+        }.minByOrNull { it.id }
+        check(home.mesh.running && home.mesh.membership().optBoolean("joined") &&
+            household == home.mesh.membership().optString("home_id") &&
+            session == home.mesh.nodes.value.firstOrNull { it.self }?.session &&
+            currentLeader?.id == leader.id && currentLeader?.session == leader.session &&
+            localPreferences.toString() == home.mesh.coordination.preferences().toString()) {
+            "Coordinator or preferences changed; nothing dispatched"
+        }
         val result = JSONObject()
-        val localPreferences = home.mesh.coordination.preferences()
         for (role in listOf("brain", "executor", "responder")) {
             val localTarget = if (localPreferences.optString("mode") == "manual") localPreferences.optString(role) else ""
             val selected = localTarget.ifBlank { if (preferences.optString("mode") == "manual") preferences.optString(role) else "" }
@@ -191,7 +230,8 @@ class HomeRouting(private val home: HomeEngine, private val host: HostServices) 
 
     /** null means the normal local pipeline remains authoritative. No remote retry/fallback after send. */
     suspend fun route(requestId: String, text: String): JSONObject? {
-        if (!home.mesh.membership().optBoolean("joined") || !home.mesh.running) return null
+        if (!home.mesh.membership().optBoolean("joined")) return null
+        if (!home.mesh.running) return failure("Household transport unavailable; no silent local fallback")
         require(HomeLink.validUuid(requestId) && text.isNotBlank())
         val targets = targets()
         val brain = targets.optString("brain", home.mesh.nodeId)
@@ -199,9 +239,12 @@ class HomeRouting(private val home: HomeEngine, private val host: HostServices) 
         val executor = targets.optString("executor", brain)
         if (executor != brain) return failure("Selected executor differs from brain; use explicit home_plan_dispatch for that device")
         if (brain == home.mesh.nodeId && responder == home.mesh.nodeId) return null
-        val peer = home.mesh.nodes.value.firstOrNull { it.id == brain && it.online() }
         if (text.toByteArray(Charsets.UTF_8).size > 3_000) return failure("Request is too large for one encrypted turn; split it explicitly")
-        if (brain != home.mesh.nodeId && peer?.secureVersion != 1) return failure("Selected brain is offline or lacks encrypted routing")
+        for (target in setOf(brain, responder)) {
+            if (target != home.mesh.nodeId && home.mesh.nodes.value.none {
+                    it.id == target && it.online() && it.secureVersion == 1
+                }) return failure("Selected private node is offline or lacks encrypted routing; nothing dispatched")
+        }
         val localContext = if (home.sharing.snapshot().optBoolean("shareContext")) compactContext(host.homeContext(text.take(512)), 4_000) else "{}"
         val request = JSONObject().put("request_id", requestId).put("text", text)
             .put("context", localContext.takeIf { it.toByteArray(Charsets.UTF_8).size <= 4_000 } ?: "{}")

@@ -89,7 +89,7 @@ import org.json.JSONObject
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
-fun HomeScreen(engine: HomeEngine, host: ScreenHost) {
+fun HomeScreen(engine: HomeEngine, host: ScreenHost, settingsTransfer: HomeSettingsTransfer? = null) {
     val language = LocalConfiguration.current.locales[0].language
     val copy = remember(language) { copyFor(language) }
     val coordinationCopy = remember(language) { coordinationCopyFor(language) }
@@ -296,6 +296,15 @@ fun HomeScreen(engine: HomeEngine, host: ScreenHost) {
 
                 item(key = "private-sharing", contentType = "settings") {
                     SharingSection(engine.sharing, sharingCopyFor(language), copy)
+                }
+
+                if (settingsTransfer != null) {
+                    item(key = "settings-transfer", contentType = "settings") {
+                        SettingsTransferSection(engine, settingsTransfer, nodes, transferCopyFor(language), copy)
+                    }
+                }
+                item(key = "manual-discovery", contentType = "settings") {
+                    ManualSeedsSection(engine, transferCopyFor(language), copy)
                 }
 
                 item(key = "coordination", contentType = "coordination") {
@@ -1479,6 +1488,7 @@ private fun GlassField(
     value: String,
     secret: Boolean = false,
     enabled: Boolean = true,
+    multiline: Boolean = false,
     onValueChange: (String) -> Unit,
 ) {
     Column(Modifier.fillMaxWidth().padding(top = Spacing.sm)) {
@@ -1491,7 +1501,7 @@ private fun GlassField(
             value = value,
             enabled = enabled,
             onValueChange = onValueChange,
-            singleLine = true,
+            singleLine = !multiline,
             visualTransformation = if (secret) PasswordVisualTransformation() else VisualTransformation.None,
             textStyle = MaterialTheme.typography.bodyLarge.copy(
                 color = MaterialTheme.colorScheme.onSurface,
@@ -1499,7 +1509,7 @@ private fun GlassField(
             cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
             keyboardOptions = KeyboardOptions(
                 keyboardType = if (secret) KeyboardType.Password else KeyboardType.Text,
-                imeAction = ImeAction.Next,
+                imeAction = if (multiline) ImeAction.Default else ImeAction.Next,
             ),
             modifier = Modifier
                 .fillMaxWidth()
@@ -1518,5 +1528,120 @@ private fun GlassField(
                 inner()
             },
         )
+    }
+}
+
+/** Never render or retain credential values in Compose state. All actions are local clicks. */
+@Composable
+private fun SettingsTransferSection(engine: HomeEngine, transfer: HomeSettingsTransfer,
+    nodes: List<MeshNode>, copy: TransferCopy, common: Copy) {
+    val sharing by engine.sharing.state.collectAsStateWithLifecycle()
+    val reviews by transfer.pending.collectAsStateWithLifecycle()
+    val scope = rememberCoroutineScope()
+    var keys by remember(transfer) { mutableStateOf(false) }
+    var settings by remember(transfer) { mutableStateOf(false) }
+    var peer by remember(transfer) { mutableStateOf<String?>(null) }
+    var busy by remember(transfer) { mutableStateOf(false) }
+    var status by remember(transfer) { mutableStateOf<String?>(null) }
+    var confirmSend by remember(transfer) { mutableStateOf(false) }
+    val online = nodes.filter { !it.self && it.online() && it.secureVersion == 1 }
+    fun action(success: String?, block: suspend () -> Unit) {
+        if (busy) return
+        busy = true
+        status = null
+        scope.launch {
+            try { withContext(Dispatchers.IO) { block() }; status = success }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { status = copy.failed }
+            finally { busy = false }
+        }
+    }
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+        SectionTitle(copy.title)
+        Text(copy.warning, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        GlassGroup {
+            SettingsToggleRow(title = copy.receive, subtitle = null, checked = sharing.receiveSettings,
+                enabled = !busy, modifier = Modifier.heightIn(min = 48.dp), onCheckedChange = { enabled ->
+                    action(null) {
+                        engine.sharing.update(JSONObject().put("receiveSettings", enabled))
+                        // Withdraw queued offers immediately, not just on the next periodic prune.
+                        if (!enabled) transfer.clear()
+                    }
+                })
+            GlassDivider()
+            SettingsToggleRow(title = copy.keys, subtitle = null, checked = keys, enabled = !busy,
+                modifier = Modifier.heightIn(min = 48.dp), onCheckedChange = { keys = it })
+            GlassDivider()
+            SettingsToggleRow(title = copy.settings, subtitle = null, checked = settings, enabled = !busy,
+                modifier = Modifier.heightIn(min = 48.dp), onCheckedChange = { settings = it })
+        }
+        if (online.isEmpty()) Text(copy.noPeers, style = MaterialTheme.typography.bodyMedium)
+        GlassGroup {
+            online.forEach { node ->
+                CoordinationRadioRow(node.name, node.id, peer == node.id, !busy) { peer = node.id }
+            }
+        }
+        PrimaryButton(copy.send, enabled = !busy && (keys || settings) && online.any { it.id == peer },
+            onClick = { confirmSend = true }, modifier = Modifier.fillMaxWidth())
+        if (confirmSend) {
+            GlassDialog(title = copy.send,
+                message = "${online.firstOrNull { it.id == peer }?.name.orEmpty()}\n" +
+                    listOfNotNull(copy.keys.takeIf { keys }, copy.settings.takeIf { settings }).joinToString(" · ") + "\n" + copy.warning,
+                confirmLabel = copy.send, dismissLabel = common.cancel,
+                onConfirm = {
+                    confirmSend = false
+                    val target = peer
+                    val sendKeys = keys
+                    val sendSettings = settings
+                    if (target != null) action(copy.pending) {
+                        val result = transfer.send(target, sendKeys, sendSettings)
+                        check(result.optBoolean("ok") && result.optJSONObject("data")?.optString("status") == "pending_review")
+                    }
+                }, onDismiss = { confirmSend = false })
+        }
+        reviews.forEach { review ->
+            GlassCard(contentPadding = Spacing.md) {
+                Text("${copy.review} ${review.sender}", style = MaterialTheme.typography.titleMedium)
+                // Protocol identifiers only; never interpolate incoming values or host exceptions.
+                Text(review.fields.joinToString("\n"), style = MaterialTheme.typography.bodyMedium)
+                PrimaryButton(copy.approve, enabled = !busy,
+                    onClick = { action(copy.done) { transfer.approve(review.id) } }, modifier = Modifier.fillMaxWidth())
+                if (!busy) GhostButton(common.cancel,
+                    onClick = { action(null) { transfer.reject(review.id) } }, modifier = Modifier.fillMaxWidth())
+            }
+        }
+        status?.let { Text(it, style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite }) }
+    }
+}
+
+@Composable
+private fun ManualSeedsSection(engine: HomeEngine, copy: TransferCopy, common: Copy) {
+    val scope = rememberCoroutineScope()
+    var value by remember(engine) { mutableStateOf("") }
+    var busy by remember(engine) { mutableStateOf(false) }
+    var failed by remember(engine) { mutableStateOf(false) }
+    LaunchedEffect(engine) {
+        try { value = withContext(Dispatchers.IO) { engine.mesh.settings.seeds.joinToString("\n") } }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { failed = true }
+    }
+    GlassCard(contentPadding = Spacing.md) {
+        Text(copy.seeds, style = MaterialTheme.typography.titleMedium)
+        Text(copy.seedsHint, style = MaterialTheme.typography.bodyMedium)
+        GlassField(label = copy.seeds, value = value, enabled = !busy, multiline = true, onValueChange = { value = it })
+        PrimaryButton(common.save, enabled = !busy, modifier = Modifier.fillMaxWidth(), onClick = {
+            busy = true
+            failed = false
+            val addresses = value.lines().map { it.trim() }.filter { it.isNotEmpty() }
+            scope.launch {
+                try { withContext(Dispatchers.IO) { engine.mesh.updateConfig(seeds = addresses) } }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { failed = true }
+                finally { busy = false }
+            }
+        })
+        if (failed) Text(common.membershipFailed, style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.error, modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
     }
 }

@@ -26,7 +26,7 @@ class HomeSharing(context: Context) {
      */
     @Synchronized
     fun update(patch: JSONObject): JSONObject {
-        val keys = setOf("shareContext", "allowBrain", "allowSpeaker", "allowListener")
+        val keys = setOf("shareContext", "allowBrain", "allowSpeaker", "allowListener", "receiveSettings")
         patch.keys().forEach { key ->
             require(key in keys && patch.get(key) is Boolean) { "Invalid sharing preference: $key" }
         }
@@ -38,6 +38,7 @@ class HomeSharing(context: Context) {
             allowBrain = value("allowBrain", before.allowBrain),
             allowSpeaker = value("allowSpeaker", before.allowSpeaker),
             allowListener = value("allowListener", before.allowListener),
+            receiveSettings = value("receiveSettings", before.receiveSettings),
         )
         if (requested == before) return before.toJson()
         check(before.generation < Long.MAX_VALUE) { "Sharing generation exhausted" }
@@ -57,11 +58,13 @@ class HomeSharing(context: Context) {
         .putBoolean("allowBrain", value.allowBrain)
         .putBoolean("allowSpeaker", value.allowSpeaker)
         .putBoolean("allowListener", value.allowListener)
+        .putBoolean("receiveSettings", value.receiveSettings)
         .putLong("generation", value.generation)
         .commit()
 
     private fun read(): HomeSharingState = try {
         HomeSharingState(
+            receiveSettings = preferences.getBoolean("receiveSettings", false),
             shareContext = preferences.getBoolean("shareContext", false),
             allowBrain = preferences.getBoolean("allowBrain", false),
             allowSpeaker = preferences.getBoolean("allowSpeaker", false),
@@ -82,11 +85,13 @@ data class HomeSharingState(
     val allowSpeaker: Boolean = false,
     val generation: Long = 0L,
     val allowListener: Boolean = false,
+    val receiveSettings: Boolean = false,
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("shareContext", shareContext)
         .put("allowBrain", allowBrain)
         .put("allowSpeaker", allowSpeaker)
         .put("allowListener", allowListener)
+        .put("receiveSettings", receiveSettings)
         .put("generation", generation)
 }
