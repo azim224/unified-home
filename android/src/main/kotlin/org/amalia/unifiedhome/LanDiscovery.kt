@@ -84,12 +84,18 @@ internal object LanDiscovery {
                     currentCoroutineContext().ensureActive()
                     if (!current()) return@coroutineScope
                     group.map { (host, port) -> async {
+                        currentCoroutineContext().ensureActive()
+                        if (!current()) return@async
                         try {
                             Socket().use { socket ->
                                 val deadline = deadlines.schedule({ runCatching { socket.close() } },
                                     (connectTimeout + 2_000).toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
                                 try {
-                                    socket.connect(InetSocketAddress(InetAddress.getByName(host), port), connectTimeout)
+                                    val address = InetAddress.getByName(host)
+                                    currentCoroutineContext().ensureActive()
+                                    if (!current() || socket.isClosed) return@use
+                                    socket.connect(InetSocketAddress(address, port), connectTimeout)
+                                    currentCoroutineContext().ensureActive()
                                     if (!current()) return@use
                                     DataOutputStream(socket.getOutputStream()).apply {
                                         writeInt(payload.size)

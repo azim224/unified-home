@@ -22,6 +22,8 @@ internal class ReliableTransport(port: Int, private val receive: (ByteArray, Str
         ArrayBlockingQueue<Runnable>(16), factory, ThreadPoolExecutor.AbortPolicy())
     private val inbound = pool()
     private val outbound = pool()
+    private val presence = ThreadPoolExecutor(2, 2, 0L, TimeUnit.MILLISECONDS,
+        ArrayBlockingQueue<Runnable>(16), factory, ThreadPoolExecutor.AbortPolicy())
     private val timer = ScheduledThreadPoolExecutor(1, factory).apply { removeOnCancelPolicy = true }
     private val connections = ConcurrentHashMap.newKeySet<Socket>()
     private val server = ServerSocket()
@@ -78,7 +80,7 @@ internal class ReliableTransport(port: Int, private val receive: (ByteArray, Str
     }
 
     /** True means queued, NOT acknowledged or executed. Never fall back to UDP on failure. */
-    fun send(host: String, port: Int, payload: ByteArray, current: () -> Boolean): Boolean {
+    fun send(host: String, port: Int, payload: ByteArray, discovery: Boolean = false, current: () -> Boolean): Boolean {
         if (!running || payload.isEmpty() || payload.size > HomeLink.MAX_PACKET) return false
         val socket = Socket()
         connections.add(socket)
@@ -88,7 +90,9 @@ internal class ReliableTransport(port: Int, private val receive: (ByteArray, Str
             // Queue delay is included so an expired request is not sent much later under load.
             val expiry = timer.schedule({ closeSocket(socket) }, 8, TimeUnit.SECONDS)
             deadline = expiry
-            outbound.execute {
+            // Discovery replies must not consume the RPC/result delivery queue.
+            val executor = if (discovery) presence else outbound
+            executor.execute {
                 try {
                     // current() may wait for the mesh monitor; recheck closure after it returns.
                     if (!current() || !running || socket.isClosed) return@execute
@@ -129,6 +133,7 @@ internal class ReliableTransport(port: Int, private val receive: (ByteArray, Str
         runCatching { server.close() }
         inbound.shutdownNow()
         outbound.shutdownNow()
+        presence.shutdownNow()
         timer.shutdownNow()
         connections.toList().forEach { closeSocket(it) }
     }

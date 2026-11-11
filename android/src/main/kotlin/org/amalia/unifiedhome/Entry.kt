@@ -59,7 +59,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
     override val metadata: PluginMetadata = PluginMetadata(
         id = "org.amalia.unifiedhome.native",
         name = "Единый дом",
-        version = "1.1.0",
+        version = "1.1.1",
         author = "Amalia",
         description = "Устройства, сцены с подтверждением и локальная сеть Амалии.",
         category = PluginCategory.SCREEN,
@@ -152,7 +152,8 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
                 textRes = 0,
                 title = copy.title,
                 text = copy.text,
-                foregroundType = BackgroundWorkType.DATA_SYNC,
+                // Continuous LAN device communication, not a time-limited data sync.
+                foregroundType = BackgroundWorkType.CONNECTED_DEVICE,
             )
         }
     }

@@ -1,3 +1,30 @@
+# Stability revision — 2026-11-11 (plugin 1.1.1)
+
+- Android separates known-peer heartbeats, manual seed probes and optional UDP work;
+  slow DNS no longer stalls established TCP presence. Announcement replies use their
+  own bounded executor, not the RPC/result queue. Cancelled probes and old listener
+  sessions are checked before admission/write.
+- Android accepts PC `tcp_port:0` while the PC TCP listener recovers; authenticated
+  UDP presence is retained rather than silently discarding the member.
+- Household foreground work now uses `CONNECTED_DEVICE`, not time-limited
+  `DATA_SYNC`. Install the updated Android host and export its exact native SDK
+  before packaging this plugin. Old host/SDK builds do not contain that enum.
+- The Android repository CI example is synchronized with this full source set.
+  Update the installed signed plugin as well as the host APK; APK updates alone
+  do not replace a user-installed plugin DEX.
+- PC uses lazy event-loop locks (including Python 3.8), refreshes stale manual
+  discovery batches, and advertises TCP only when actually listening.
+- Wire framing, HMAC, membership/session checks and single-shot command execution
+  are unchanged. No uncertain side effect is retried automatically.
+
+Verification: Kotlin PSI syntax check (not type/API compilation), XML/JSON and
+whitespace checks; existing PC tests and local PC socket exercises. Physical
+Android/Windows exchange remains unverified. The local SDK is stale/inconsistent;
+its checksum validation fails and its host JAR lacks settings-transfer methods.
+Regenerate it from the updated host in CI, never edit its inventory to bypass this.
+
+---
+
 # TCP discovery revision — 2026-11-10
 
 This section supersedes the UDP discovery requirement below.
