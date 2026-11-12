@@ -68,7 +68,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
     override val metadata: PluginMetadata = PluginMetadata(
         id = "org.amalia.unifiedhome.native",
         name = "Единый дом",
-        version = "1.1.3",
+        version = "1.2.0",
         author = "Amalia",
         description = "Устройства, сцены с подтверждением и локальная сеть Амалии.",
         category = PluginCategory.SCREEN,
@@ -81,6 +81,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
     private var meshRequested = false
     @Volatile private var enabled = false
     @Volatile private var homeV2: HomeV2Node? = null
+    private var homePairing: org.amalia.unifiedhome.v2.HomeV2Pairing? = null
     private var homeV2Data: org.amalia.unifiedhome.v2.HomeV2Data? = null
     private var homeV2Sync: kotlinx.coroutines.Job? = null
     private var homeV2CoordinationJob: kotlinx.coroutines.Job? = null
@@ -100,6 +101,10 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
         services = context.services
         appContext = context.appContext
         homeV2 = HomeV2Node(context.appContext, context.services, created)
+        homeV2?.let { node ->
+            homePairing = org.amalia.unifiedhome.v2.HomeV2Pairing(
+                node.status.value.nodeId, node.deviceName, created, node::pairingInvitation)
+        }
         engine = HomeEngine(context.appContext, created).also { home ->
             home.mesh.coordination.attach(home)
             settingsTransfer = HomeSettingsTransfer(home, context.services, created)
@@ -160,6 +165,11 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
         if (!enabled) return
         val node = homeV2 ?: return
         val home = engine ?: return
+        if (services?.ensureForeground(metadata.id) == true) {
+            try { homePairing?.start() }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { android.util.Log.w("UnifiedHome", "Home pairing discovery unavailable") }
+        }
         if (node.status.value.homeId != null) {
             meshRequested = false
             settingsTransfer?.stop()
@@ -273,7 +283,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
         enabled = false
         meshRequested = false
         val node = homeV2
-        scope?.launch(NonCancellable + Dispatchers.IO) { lifecycleGate.withLock { node?.stop() } }
+        scope?.launch(NonCancellable + Dispatchers.IO) { lifecycleGate.withLock { homePairing?.stop(); node?.stop() } }
         settingsTransfer?.stop()
         engine?.mesh?.coordination?.setVoiceHookEnabled(false)
         engine?.stopMesh()
@@ -289,11 +299,14 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
         val assistant = homeV2Assistant
         val control = homeV2Control
         val scheduler = homeV2Scheduler
+        val pairing = homePairing
+        homePairing = null
         homeV2Scheduler = null
         homeV2Control = null
         homeV2Assistant = null
         homeV2Data = null
         scope?.launch(NonCancellable + Dispatchers.IO) { lifecycleGate.withLock {
+            pairing?.stop()
             node?.stop()
             scheduler?.closeAndWait()
             data?.closeAndWait()
@@ -320,7 +333,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
         synchronized(this@HomeProduct) {
             val home = engine ?: return@synchronized BackgroundState.Idle
             val v2Active = enabled && homeV2?.status?.value?.homeId != null
-            if (!v2Active && ((!meshRequested && !home.mesh.running) || !home.mesh.membership().optBoolean("joined"))) {
+            if (!v2Active && !(enabled && homePairing != null) && ((!meshRequested && !home.mesh.running) || !home.mesh.membership().optBoolean("joined"))) {
                 return@synchronized BackgroundState.Idle
             }
             val languageTag = appContext?.resources?.configuration?.locales?.get(0)?.toLanguageTag().orEmpty()
@@ -410,14 +423,14 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
                             }
                         }
                         node.start()
-                    } else HomeV2Screen(node,screenHost) { reconcileHomeNetworks() }
+                    } else HomeV2Screen(node,screenHost, homePairing) { reconcileHomeNetworks() }
                 })
         )
         return management + listOf(
             ScreenSpec(
                 route = "amalia://screen/house-v2", titleRes = 0,
                 title = homeV2Title(appContext?.resources?.configuration?.locales?.get(0)?.language.orEmpty()), inNavigation = true, iconName = "lamp",
-                content = { host -> HomeV2Screen(node, host) { reconcileHomeNetworks() } },
+                content = { host -> HomeV2Screen(node, host, homePairing) { reconcileHomeNetworks() } },
             ),
             ScreenSpec(
                 route = "amalia://screen/house",

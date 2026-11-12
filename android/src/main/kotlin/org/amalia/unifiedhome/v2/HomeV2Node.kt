@@ -116,6 +116,11 @@ class HomeV2Node(context: Context, private val host: HostServices, private val s
         v2Require(store.membership == null, "leave_required"); V2Store.parseInvitation(invitation)
     }
     suspend fun leaveHome(): HomeV2Status = changeMembership { null }
+    /** Internal, local pairing-only export; never a model/RPC/discovery field. */
+    internal fun pairingInvitation(): String? = synchronized(lock) {
+        store.membership?.let { "amalia-home:v3:${it.home}:${V2Store.hex(it.secret)}" }
+    }
+
     suspend fun exportInvitation(): String = withContext(Dispatchers.IO) { gate.withLock {
         val m = store.membership ?: throw V2Failure("no_active_home")
         "amalia-home:v3:${m.home}:${V2Store.hex(m.secret)}"

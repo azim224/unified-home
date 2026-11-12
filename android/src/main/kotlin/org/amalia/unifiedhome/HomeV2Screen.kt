@@ -75,7 +75,8 @@ private fun V2Field(label: String, value: String, secret: Boolean = false, onCha
 }
 
 @Composable
-fun HomeV2Screen(node: HomeV2Node, host: ScreenHost, membershipChanged: suspend () -> Unit) {
+fun HomeV2Screen(node: HomeV2Node, host: ScreenHost,
+    pairing: org.amalia.unifiedhome.v2.HomeV2Pairing? = null, membershipChanged: suspend () -> Unit) {
     val language = LocalConfiguration.current.locales[0].language
     val copy = remember(language) { v2Copy(language) }
     val status by node.status.collectAsStateWithLifecycle()
@@ -123,6 +124,12 @@ fun HomeV2Screen(node: HomeV2Node, host: ScreenHost, membershipChanged: suspend 
     LaunchedEffect(selected) { catalogue = null; task = null; taskId = "" }
     AmaliaScreen(title = copy[0], onBack = host::goBack, backLabel = copy[1]) { insets ->
         LazyColumn(contentPadding = insets, modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+            if (pairing != null) item("automatic-pairing") {
+                HomeV2PairingPanel(pairing, status.homeId != null) { invitation ->
+                    node.joinHome(invitation)
+                    membershipChanged()
+                }
+            }
             item("membership") {
                 GlassCard(contentPadding = Spacing.md) {
                     Text(if (status.homeId == null) copy[11] else "${copy[12]} · ${status.homeId}", style = MaterialTheme.typography.bodyLarge)
