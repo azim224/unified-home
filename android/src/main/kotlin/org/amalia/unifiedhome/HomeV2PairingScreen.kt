@@ -22,6 +22,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.amalia.unifiedhome.v2.HomeV2Exception
 import org.amalia.unifiedhome.v2.HomeV2Pairing
 
 private fun pairingCopy(language: String): List<String> = (when (language) {
@@ -34,7 +35,17 @@ private fun pairingCopy(language: String): List<String> = (when (language) {
     "hi" -> "डिवाइस जोड़ें|120 सेकंड के लिए नया डिवाइस अनुमति दें|जोड़ने की अनुमति खुली है|जोड़ने की अनुमति बंद है|अनुरोधकर्ता|सत्यापन कोड|दोनों डिवाइस पर कोड मिलाएँ। समान कोड वाले परिचित डिवाइस को ही अनुमति दें।|कोड समान हैं — अनुमति दें|डिवाइस अस्वीकार करें|खोजे गए घर|अभी कोई घर नहीं मिला। साझा नेटवर्क जाँचें।|बिना नाम का घर|जोड़ने के लिए उपलब्ध|बंद है — होस्ट पर खोलें|इससे जुड़ें|जुड़ रहा है…|इस कोड को होस्ट पर मिलाएँ। फिर मालिक को होस्ट पर अनुमति देनी होगी।|कोड समान हैं — पूरा करें|होस्ट की अनुमति की प्रतीक्षा…|जोड़ना रद्द करें|जोड़ना विफल रहा। नेटवर्क जाँचें और मैन्युअल रूप से फिर प्रयास करें।|समय समाप्त हुआ। दोबारा शुरू करें।|खोज का अर्थ भरोसा नहीं है। केवल विश्वसनीय घर से जुड़ें: सदस्य डिवाइस की अनुमतियों के भीतर डेटा और कार्रवाइयों तक पहुँच पाते हैं।"
     "ar" -> "إقران الأجهزة|السماح بجهاز جديد لمدة 120 ثانية|الإقران مفتوح|الإقران مغلق|طلب من|رمز التحقق|قارن الرمزين على الجهازين. وافق فقط على جهاز معروف برمز مطابق.|الرمزان متطابقان — موافقة|رفض الجهاز|المنازل المكتشفة|لم تُكتشف منازل بعد. تحقق من الشبكة المشتركة.|منزل بلا اسم|متاح للإقران|مغلق — افتحه على المضيف|الاتصال بـ|جارٍ الاتصال…|قارن هذا الرمز على المضيف. بعد ذلك يجب على المالك الموافقة على المضيف.|الرمزان متطابقان — إتمام|بانتظار موافقة المضيف…|إلغاء الإقران|تعذر الإقران. تحقق من الشبكة وحاول مجددًا يدويًا.|انتهت المهلة. ابدأ الإقران من جديد.|الاكتشاف لا يعني الثقة. انضم فقط إلى منزل موثوق: يصل الأعضاء إلى البيانات والإجراءات ضمن أذونات الجهاز."
     else -> "Pair devices|Allow a new device for 120 seconds|Pairing window open|Pairing window closed|Request from|Verification code|Compare codes on both devices. Approve only a known device with a matching code.|Codes match — approve|Reject device|Discovered homes|No homes found yet. Check the shared network.|Unnamed home|Available to pair|Closed — open pairing on the host|Connect to|Connecting…|Compare this code on the HOST. Then the owner must approve the connection on the host.|Codes match — finish|Waiting for host approval…|Cancel pairing|Pairing did not complete. Check the network and try again manually.|Pairing timed out. Start again.|Discovery does not mean trust. Join only a trusted home: members can access data and actions within the device’s permissions."
-}).split('|')
+}).split('|') + when (language) {
+    "ru" -> "Одобрено — ожидание подключаемого устройства…"
+    "de" -> "Freigegeben — warte auf das beitretende Gerät…"
+    "es" -> "Aprobado — esperando al dispositivo que se une…"
+    "fr" -> "Autorisé — en attente de l’appareil qui rejoint…"
+    "ja" -> "承認済み — 接続する端末を待っています…"
+    "zh" -> "已批准 — 正在等待加入的设备…"
+    "hi" -> "अनुमति दी गई — जुड़ने वाले डिवाइस की प्रतीक्षा…"
+    "ar" -> "تمت الموافقة — بانتظار الجهاز المنضم…"
+    else -> "Approved — waiting for the joining device…"
+}
 
 @Composable
 private fun PairingButton(label: String, enabled: Boolean = true, onClick: () -> Unit) {
@@ -65,6 +76,12 @@ fun HomeV2PairingPanel(pairing: HomeV2Pairing, joined: Boolean, onJoin: suspend 
     val latestJoin by rememberUpdatedState(onJoin)
     var attempt by remember(pairing) { mutableStateOf<PairingAttempt?>(null) }
     var error by remember(pairing) { mutableStateOf<Int?>(null) }
+    var errorCode by remember(pairing) { mutableStateOf<String?>(null) }
+
+    fun showError(failure: Exception) {
+        errorCode = (failure as? HomeV2Exception)?.code
+        error = if (errorCode == "pairing_expired") 21 else 20
+    }
 
     fun cancelClient(client: PairingAttempt) {
         if (!client.active) return
@@ -75,13 +92,13 @@ fun HomeV2PairingPanel(pairing: HomeV2Pairing, joined: Boolean, onJoin: suspend 
         if (attempt === client) attempt = null
         try { pairing.cancel() }
         catch (cancelled: CancellationException) { throw cancelled }
-        catch (_: Exception) { error = 20 }
+        catch (failure: Exception) { showError(failure) }
     }
     fun hostAction(action: () -> Unit) {
-        error = null
+        error = null; errorCode = null
         try { action() }
         catch (cancelled: CancellationException) { throw cancelled }
-        catch (_: Exception) { error = 20 }
+        catch (failure: Exception) { showError(failure) }
     }
 
     DisposableEffect(pairing) {
@@ -107,8 +124,8 @@ fun HomeV2PairingPanel(pairing: HomeV2Pairing, joined: Boolean, onJoin: suspend 
             else if (client.active) latestJoin(invitation)
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (_: Exception) {
-            error = 20
+        } catch (failure: Exception) {
+            showError(failure)
         } finally {
             cancelClient(client)
         }
@@ -119,7 +136,12 @@ fun HomeV2PairingPanel(pairing: HomeV2Pairing, joined: Boolean, onJoin: suspend 
             Text(copy[0], style = MaterialTheme.typography.titleMedium)
             Text(copy[22], style = MaterialTheme.typography.bodyMedium)
             if (joined) {
-                Text(if (status.open) copy[2] else copy[3], style = MaterialTheme.typography.bodyMedium)
+                Text(when {
+                    status.approved -> copy[23]
+                    status.pendingName != null -> copy[5]
+                    status.open -> copy[2]
+                    else -> copy[3]
+                }, style = MaterialTheme.typography.bodyMedium)
                 PairingButton(copy[1], !status.open && status.pendingName == null) { hostAction { pairing.openWindow() } }
                 val pendingName = status.pendingName
                 val hostCode = status.code
@@ -129,12 +151,15 @@ fun HomeV2PairingPanel(pairing: HomeV2Pairing, joined: Boolean, onJoin: suspend 
                         Text("${copy[5]} · $hostCode", style = MaterialTheme.typography.headlineSmall)
                         Text(copy[6], style = MaterialTheme.typography.bodyMedium)
                     }
-                    PairingButton(copy[7], !hostCode.isNullOrBlank()) { hostAction { pairing.approve() } }
+                    PairingButton(copy[7], !status.approved && !hostCode.isNullOrBlank()) { hostAction { pairing.approve() } }
                     PairingButton(copy[8]) { hostAction { pairing.reject() } }
                 }
             }
             if (error != null || status.error != null) {
-                Text(copy[error ?: 20], style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
+                val code = if (error != null) errorCode else status.error
+                val message = copy[if (code == "pairing_expired") 21 else error ?: 20]
+                Text(if (code == null) message else "$message ($code)",
+                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
             }
         }
         if (!joined && client != null) {
@@ -162,7 +187,7 @@ fun HomeV2PairingPanel(pairing: HomeV2Pairing, joined: Boolean, onJoin: suspend 
                     Text(if (peer.open) copy[12] else copy[13], style = MaterialTheme.typography.bodyMedium)
                     if (!joined) PairingButton("${copy[14]} $name", peer.open && client == null) {
                         if (attempt == null) {
-                            error = null
+                            error = null; errorCode = null
                             val next = PairingAttempt(name)
                             attempt = next
                             next.job = scope.launch {
@@ -172,8 +197,8 @@ fun HomeV2PairingPanel(pairing: HomeV2Pairing, joined: Boolean, onJoin: suspend 
                                     if (next.active) next.code = code
                                 } catch (cancelled: CancellationException) {
                                     throw cancelled
-                                } catch (_: Exception) {
-                                    error = 20
+                                } catch (failure: Exception) {
+                                    showError(failure)
                                     cancelClient(next)
                                 }
                             }

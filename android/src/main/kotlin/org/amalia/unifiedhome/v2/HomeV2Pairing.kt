@@ -55,6 +55,7 @@ data class PairingPeer(
 data class PairingStatus(
     val open: Boolean = false, val code: String? = null,
     val pendingName: String? = null, val error: String? = null,
+    val approved: Boolean = false,
 )
 
 /** Local-human-only SAS pairing. Discovery is untrusted; compare both displayed codes before
@@ -96,7 +97,7 @@ class HomeV2Pairing(
         val transcript: ByteArray, val deadline: Long,
         var delivered: JSONObject? = null, var deliveredUntil: Long = 0,
     )
-    private class Outgoing(val peer: PairingPeer, val initialInvitation: String?, val deadline: Long) {
+    private class Outgoing(val peer: PairingPeer, val initialInvitation: String?, var deadline: Long) {
         var session: String? = null
         var key: ByteArray? = null
         var transcript: ByteArray? = null
@@ -182,8 +183,9 @@ class HomeV2Pairing(
     /** Invoke only after the human compared the six digits on both devices. */
     fun approve() = action {
         maintain()
-        val p = incoming ?: throw HomeV2Exception("no_pending_pairing")
-        v2Require(p.delivered == null && windowUntil > now(), "pairing_closed")
+        val p = incoming ?: throw HomeV2Exception(mutableStatus.value.error ?: "no_pending_pairing")
+        if (p.delivered != null) return@action // Repeated confirmation must retain the same delivery.
+        v2Require(p.deadline > now(), "pairing_expired")
         v2Require(invitation() == p.invitation, "membership_changed")
         val nonce = V2Wire.randomBytes(12)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -192,11 +194,11 @@ class HomeV2Pairing(
         val delivery = JSONObject().put("op", "joined").put("nonce", b64(nonce))
             .put("ciphertext", b64(cipher.doFinal(p.invitation.toByteArray(Charsets.UTF_8))))
         v2Require(invitation() == p.invitation, "membership_changed")
-        v2Require(windowUntil > now(), "pairing_closed")
+        v2Require(p.deadline > now(), "pairing_expired")
         p.delivered = delivery
         p.deliveredUntil = now() + WINDOW
         windowUntil = 0; windowInvitation = null
-        mutableStatus.value = PairingStatus()
+        mutableStatus.value = mutableStatus.value.copy(open = false, approved = true, error = null)
     }
 
     fun reject() { cancel() }
@@ -221,7 +223,12 @@ class HomeV2Pairing(
         r.scope.launch {
             synchronized(lock) {
                 if (runtime !== r || actionEpoch != epoch) return@synchronized
-                try { block() } catch (_: Exception) { clearPairing("pairing_unavailable") }
+                try { block() } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    val code = safeFailure(e).code
+                    if (code == "membership_changed") clearPairing(code)
+                    else mutableStatus.value = mutableStatus.value.copy(error = code)
+                }
             }
         }
     }
@@ -268,10 +275,11 @@ class HomeV2Pairing(
                     v2Require(runtime === r && outgoing === p && now() < p.deadline, "pairing_cancelled")
                     v2Require(invitation() == p.initialInvitation, "membership_changed")
                     p.session = session; p.key = key; p.transcript = transcript
+                    p.deadline = now() + WINDOW
                     sas(key).also { mutableStatus.value = PairingStatus(code = it, pendingName = peer.name) }
                 }
             } catch (e: Exception) {
-                synchronized(lock) { if (outgoing === p) clearPairing("pairing_failed") }
+                synchronized(lock) { if (outgoing === p) clearPairing(if (e is CancellationException) null else safeFailure(e).code) }
                 if (e is CancellationException) throw e
                 throw safeFailure(e)
             }
@@ -286,7 +294,7 @@ class HomeV2Pairing(
             synchronized(lock) {
                 r = runtime ?: throw HomeV2Exception("pairing_stopped")
                 maintain()
-                p = outgoing ?: throw HomeV2Exception("no_pending_pairing")
+                p = outgoing ?: throw HomeV2Exception(mutableStatus.value.error ?: "no_pending_pairing")
                 v2Require(p.session != null, "no_pending_pairing")
                 v2Require(invitation() == p.initialInvitation, "membership_changed")
             }
@@ -479,9 +487,11 @@ class HomeV2Pairing(
             throw e
         }
         // Consume only a valid hello: malformed requests cannot replace the committed key.
-        incoming = Incoming(session, p.invitation, key, transcript, windowUntil)
+        incoming = Incoming(session, p.invitation, key, transcript, now() + WINDOW)
         offer = null
-        mutableStatus.value = PairingStatus(open = true, code = sas(key), pendingName = clientName)
+        // Discovery admission is closed, but the human comparison has its own full lifetime.
+        windowUntil = 0; windowInvitation = null
+        mutableStatus.value = PairingStatus(code = sas(key), pendingName = clientName)
         return JSONObject().put("op", "challenge").put("session", session).put("node", nodeId)
             .put("home", home).put("name", name).put("public", public)
     }

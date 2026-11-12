@@ -68,7 +68,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
     override val metadata: PluginMetadata = PluginMetadata(
         id = "org.amalia.unifiedhome.native",
         name = "Единый дом",
-        version = "1.2.0",
+        version = "1.2.1",
         author = "Amalia",
         description = "Устройства, сцены с подтверждением и локальная сеть Амалии.",
         category = PluginCategory.SCREEN,
