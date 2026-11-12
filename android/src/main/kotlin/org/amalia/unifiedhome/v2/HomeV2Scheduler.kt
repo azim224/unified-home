@@ -79,9 +79,15 @@ class HomeV2Scheduler(
             requireScheduler(ownerLock != null, "scheduler_storage_unavailable")
             opened = SQLiteDatabase.openOrCreateDatabase(file, null)
             db = opened
-            db.execSQL("PRAGMA journal_mode=DELETE")
+            db.rawQuery("PRAGMA journal_mode=DELETE", null).use { cursor ->
+                check(cursor.moveToFirst()) { "Missing SQLite pragma result" }
+                check(cursor.getString(0).equals("delete", ignoreCase = true)) { "Unexpected journal mode" }
+            }
             db.execSQL("PRAGMA synchronous=FULL")
-            db.execSQL("PRAGMA busy_timeout=5000")
+            db.rawQuery("PRAGMA busy_timeout=5000", null).use { cursor ->
+                check(cursor.moveToFirst()) { "Missing SQLite pragma result" }
+                check(cursor.getLong(0) == 5000L) { "Unexpected busy timeout" }
+            }
             requireScheduler(db.version in 0..1, "unsupported_scheduler_version")
             transaction {
                 db.execSQL("CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL)")

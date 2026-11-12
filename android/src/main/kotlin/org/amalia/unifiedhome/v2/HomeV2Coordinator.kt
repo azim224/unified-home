@@ -84,9 +84,15 @@ class HomeV2Coordinator(
             requireCoord(ownerLock != null, "coordinator_storage_unavailable")
             val database = SQLiteDatabase.openOrCreateDatabase(file, null)
             db = database
-            database.execSQL("PRAGMA journal_mode=DELETE")
+            database.rawQuery("PRAGMA journal_mode=DELETE", null).use { cursor ->
+                check(cursor.moveToFirst()) { "Missing SQLite pragma result" }
+                check(cursor.getString(0).equals("delete", ignoreCase = true)) { "Unexpected journal mode" }
+            }
             database.execSQL("PRAGMA synchronous=FULL")
-            database.execSQL("PRAGMA busy_timeout=5000")
+            database.rawQuery("PRAGMA busy_timeout=5000", null).use { cursor ->
+                check(cursor.moveToFirst()) { "Missing SQLite pragma result" }
+                check(cursor.getLong(0) == 5000L) { "Unexpected busy timeout" }
+            }
             requireCoord(database.version in 0..1, "unsupported_coordinator_version")
             transaction {
                 database.execSQL("CREATE TABLE IF NOT EXISTS coordination (singleton INTEGER PRIMARY KEY CHECK(singleton=1), node TEXT NOT NULL, home TEXT NOT NULL, membership TEXT NOT NULL, preferred TEXT, term INTEGER NOT NULL, vote_term INTEGER NOT NULL, vote_candidate TEXT, vote_request TEXT, vote_lease REAL NOT NULL)")

@@ -68,7 +68,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
     override val metadata: PluginMetadata = PluginMetadata(
         id = "org.amalia.unifiedhome.native",
         name = "Единый дом",
-        version = "1.1.1",
+        version = "1.1.2",
         author = "Amalia",
         description = "Устройства, сцены с подтверждением и локальная сеть Амалии.",
         category = PluginCategory.SCREEN,
@@ -127,9 +127,39 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
 
     /** A joined v2 household must never keep the legacy transport/voice routing active. */
     private suspend fun reconcileHomeNetworks() = lifecycleGate.withLock {
-        if (!enabled) return@withLock
-        val node = homeV2 ?: return@withLock
-        val home = engine ?: return@withLock
+        try {
+            reconcileHomeNetworksLocked()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            // A supervised launch still forwards uncaught exceptions to Android's fatal handler.
+            // Fail closed, retain membership/storage, and leave the host process usable.
+            android.util.Log.e("UnifiedHome", "Home runtime initialization failed: ${failure.javaClass.name}")
+            withContext(NonCancellable) {
+                suspend fun cleanup(block: suspend () -> Unit) {
+                    try { block() }
+                    catch (error: Exception) {
+                        android.util.Log.w("UnifiedHome", "Home runtime cleanup failed: ${error.javaClass.name}")
+                    }
+                }
+                cleanup { homeV2Sync?.cancelAndJoin() }; homeV2Sync = null
+                cleanup { homeV2CoordinationJob?.cancelAndJoin() }; homeV2CoordinationJob = null
+                cleanup { homeV2?.stop() }
+                cleanup { homeV2?.setOperationHandler(emptySet(), null) }
+                cleanup { homeV2Scheduler?.closeAndWait() }; homeV2Scheduler = null
+                cleanup { homeV2Data?.closeAndWait() }; homeV2Data = null
+                cleanup { homeV2Assistant?.closeAndWait() }; homeV2Assistant = null
+                cleanup { homeV2Control?.close() }; homeV2Control = null
+                homeV2?.reportInitializationFailure()
+            }
+        }
+    }
+
+    /** Called only under lifecycleGate; newly opened resources are immediately cleanup-owned. */
+    private suspend fun reconcileHomeNetworksLocked() {
+        if (!enabled) return
+        val node = homeV2 ?: return
+        val home = engine ?: return
         if (node.status.value.homeId != null) {
             meshRequested = false
             settingsTransfer?.stop()
@@ -145,14 +175,15 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
                     homeV2CoordinationJob?.cancelAndJoin()
                     homeV2CoordinationJob = null
                     node.stop()
-                    homeV2Scheduler?.closeAndWait()
-                    homeV2Data?.closeAndWait()
-                    homeV2Assistant?.closeAndWait()
-                    homeV2Control?.close()
-                    val context = appContext ?: return@withLock
-                    val host = services ?: return@withLock
+                    node.setOperationHandler(emptySet(), null)
+                    homeV2Scheduler?.closeAndWait(); homeV2Scheduler = null
+                    homeV2Data?.closeAndWait(); homeV2Data = null
+                    homeV2Assistant?.closeAndWait(); homeV2Assistant = null
+                    homeV2Control?.close(); homeV2Control = null
+                    val context = appContext ?: return
+                    val host = services ?: return
                     val data = org.amalia.unifiedhome.v2.HomeV2Data(context, host,
-                        status.nodeId, status.homeId ?: return@withLock)
+                        status.nodeId, status.homeId ?: return).also { homeV2Data = it }
                     data.installSettingsAdapter(object : org.amalia.unifiedhome.v2.HomeV2Data.SettingsAdapter {
                         override suspend fun exportSettings() = org.json.JSONObject(host.homeTrustedExportSettings())
                         override suspend fun importSettings(patch: org.json.JSONObject) = host.homeTrustedImportSettings(patch.toString())
@@ -161,7 +192,9 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
                         override suspend fun restoreProviderProfile() = host.homeRestoreProviderProfile()
                     })
                     val assistant = org.amalia.unifiedhome.v2.HomeV2Assistant(context, host, data.homeId)
+                        .also { homeV2Assistant = it }
                     val control = org.amalia.unifiedhome.v2.HomeV2Control(context,node,data.homeId)
+                        .also { homeV2Control = it }
                     val scheduled = org.amalia.unifiedhome.v2.HomeV2ScheduleReceiver(host,data.homeId,control)
                     node.setOperationHandler(data.operations + assistant.operations + control.operations + scheduled.operations) { operation, args, from ->
                         when (operation) {
@@ -173,7 +206,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
                     }
                     homeV2Control = control
                     homeV2Scheduler = org.amalia.unifiedhome.v2.HomeV2Scheduler(context,node,host,data.homeId,control,data,
-                        scope ?: return@withLock)
+                        scope ?: return)
                     homeV2Assistant = assistant
                     homeV2Data = data
                 }
@@ -226,7 +259,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
             homeV2Assistant = null
             homeV2Control?.close()
             homeV2Control = null
-            if (!enabled) return@withLock
+            if (!enabled) return
             settingsTransfer?.start()
             home.mesh.coordination.setVoiceHookEnabled(true)
             meshRequested = true

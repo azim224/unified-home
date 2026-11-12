@@ -73,10 +73,16 @@ class HomeV2Data(
             requireData(file.canonicalFile == file.absoluteFile, "unsafe_storage_path")
             opened = SQLiteDatabase.openOrCreateDatabase(file, null)
             db = opened
-            db.execSQL("PRAGMA journal_mode=DELETE")
+            db.rawQuery("PRAGMA journal_mode=DELETE", null).use { cursor ->
+                check(cursor.moveToFirst()) { "Missing SQLite pragma result" }
+                check(cursor.getString(0).equals("delete", ignoreCase = true)) { "Unexpected journal mode" }
+            }
             db.execSQL("PRAGMA synchronous=FULL")
             db.execSQL("PRAGMA temp_store=MEMORY")
-            db.execSQL("PRAGMA busy_timeout=5000")
+            db.rawQuery("PRAGMA busy_timeout=5000", null).use { cursor ->
+                check(cursor.moveToFirst()) { "Missing SQLite pragma result" }
+                check(cursor.getLong(0) == 5000L) { "Unexpected busy timeout" }
+            }
             requireData(db.version in 0..1, "unsupported_data_version")
             transaction {
                 db.execSQL("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
@@ -93,6 +99,8 @@ class HomeV2Data(
         } catch (failure: Exception) {
             opened?.close()
             if (failure is HomeV2Exception) throw failure
+            // Log the exception type only: SQLite messages can contain private paths or data.
+            android.util.Log.e("UnifiedHome", "Home data initialization failed: ${failure.javaClass.name}")
             throw HomeV2Exception("storage_unavailable")
         }
     }

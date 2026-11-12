@@ -186,6 +186,11 @@ class HomeV2Node(context: Context, private val host: HostServices, private val s
         if (old != null) { old.close(); old.job.cancel() }
         // Do not join under gate: a connection may be waiting for gate to check its generation.
     }
+    /** Local lifecycle diagnostic only; never replace membership or expose exception messages. */
+    internal fun reportInitializationFailure() = synchronized(lock) {
+        mutableStatus.value = mutableStatus.value.copy(running = false, error = "runtime_initialization_failed")
+    }
+
     private fun active(r: Runtime) = synchronized(lock) { runtime === r && r.job.isActive && store.membership === r.membership }
     private fun features(): List<String> = listOf("node.describe") +
         (if (host.homeCapabilityApiVersion >= 2) listOf("capabilities.list", "tasks.submit", "tasks.get") else emptyList()) + extensionOperations.sorted()
