@@ -1,5 +1,7 @@
 package org.amalia.unifiedhome
 
+import android.os.SystemClock
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -30,6 +32,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.amalia.unifiedhome.v2.HomeV2Node
+import org.amalia.unifiedhome.v2.HomeV2Peer
+import org.json.JSONObject
+import java.util.UUID
 
 private data class V2Copy(val words: List<String>) {
     operator fun get(index: Int) = words[index]
@@ -45,6 +50,34 @@ private fun v2Copy(language: String): V2Copy = V2Copy((when (language) {
     "ar" -> "المنزل v2|رجوع|إنشاء منزل|انضمام|دعوة|إظهار الدعوة|إخفاء الدعوة|مغادرة|تأكيد|إلغاء|لكل الأعضاء وصول كامل إلى قدرات أماليا بما فيها البيانات الخاصة والإجراءات ذات العواقب ضمن أذونات هذا الجهاز. شارك السر مع الموثوقين فقط وليس في المحادثة. يتطلب سحب الوصول منزلاً جديداً وإعادة دعوة الآخرين. هذه ثقة منفصلة عن v1 القديم.|غير منضم|المنزل|هذا الجهاز|متصل|غير متصل|مرشحو الاكتشاف غير موثوقين. الفحص مشفر؛ العنوان وحده لا يمنح الوصول.|الأجهزة|لا أجهزة. تحقق من الشبكة أو أدخل العنوان يدوياً.|معرّف الجهاز|العنوان|المنفذ|فحص مشفر|تم التحقق|غير متحقق|الكتالوج|تحميل الكتالوج|الصفحة التالية|المهمة|معرّف المهمة|قراءة المهمة|لم تكتمل العملية. تحقق من المدخلات والشبكة ودعم المضيف. لا إعادة تلقائية.|جارٍ التنفيذ…|تم تحميل الصفحة|لا عناصر|الاكتشاف غير متاح؛ استخدم الفحص اليدوي.|اسم القدرة|الحالة|اختيار"
     else -> "Home v2|Back|Create home|Join home|Invitation|Show invitation|Hide invitation|Leave home|Confirm|Cancel|Every member has full access to all Amalia capabilities, including private data and consequential actions, within this device’s existing permissions. Share the secret only with trusted people, never in chat. Revocation requires a new home and reinviting the remaining members. This trust is separate from legacy v1.|Not joined|Home|This device|Connected|Offline|Discovery candidates are not trusted. Verification uses an encrypted connection; an address alone grants no access.|Devices|No devices. Check the network or enter an address manually.|Device ID|Address|Port|Verify encrypted connection|Verified|Unverified|Catalogue|Load catalogue|Next page|Task|Task ID|Read task|Operation did not complete. Check inputs, network and host support. No automatic retry.|Working…|Page loaded|No entries|Discovery unavailable; use manual verification.|Capability name|State|Select"
 }).split('|'))
+
+// Localized additions keep the same compact copy approach as the existing screen.
+private fun v2ToolsCopy(language: String): V2Copy = V2Copy((when (language) {
+    "ru" -> "Локальный сервер работает|Локальный сервер остановлен|Проверить снова|Последняя зашифрованная проверка|Ответ получен|Код ошибки|Время обмена (мс)|Поиск на этой странице|Входная схема|Только просмотр: запуск недоступен|Запросить сведения о системе|Запрос только читает сведения об ОС и Python на выбранном устройстве. Новый UUID будет сохранён до отправки. Очередь не означает успех. При неопределённом результате только обнови задачу, не отправляй заново.|Обновить задачу|UUID сохранён; результат может быть неизвестен. Автоповтора нет.|Завершить отслеживание|Выбранное устройство|Аргументы не требуются|Сохранённая задача|Ничего не найдено"
+    "ja" -> "ローカルサーバー稼働中|ローカルサーバー停止中|再確認|直近の暗号化確認|応答を受信|エラーコード|往復時間（ミリ秒）|このページを検索|入力スキーマ|閲覧のみ：実行不可|システム情報を要求|選択端末のOSとPython情報のみ読み取ります。送信前に新しいUUIDを保存します。待機中は成功ではありません。結果不明時はタスク確認のみ行い、再送しないでください。|タスクを更新|UUID保存済み。結果は不明の場合があります。自動再送なし。|追跡を終了|選択端末|引数不要|保存済みタスク|一致なし"
+    "de" -> "Lokaler Server läuft|Lokaler Server gestoppt|Erneut prüfen|Letzte verschlüsselte Prüfung|Antwort erhalten|Fehlercode|Hin- und Rückzeit (ms)|Diese Seite durchsuchen|Eingabeschema|Nur Ansicht: Ausführung nicht verfügbar|Systeminformationen anfordern|Liest nur OS- und Python-Fakten des gewählten Geräts. Eine neue UUID wird vor dem Senden gespeichert. Wartend bedeutet nicht erfolgreich. Bei unklarem Ergebnis nur den Aufgabenstatus abfragen, nicht erneut senden.|Aufgabe aktualisieren|UUID gespeichert; Ergebnis möglicherweise unbekannt. Keine automatische Wiederholung.|Verfolgung beenden|Gewähltes Gerät|Keine Argumente erforderlich|Gespeicherte Aufgabe|Keine Treffer"
+    "es" -> "Servidor local activo|Servidor local detenido|Volver a comprobar|Última comprobación cifrada|Respuesta recibida|Código de error|Tiempo de ida y vuelta (ms)|Buscar en esta página|Esquema de entrada|Solo consulta: ejecución no disponible|Solicitar información del sistema|Solo lee datos del SO y Python del dispositivo seleccionado. Se guardará un UUID nuevo antes de enviar. En cola no significa éxito. Si el resultado es incierto, consulta la tarea sin reenviarla.|Actualizar tarea|UUID guardado; el resultado puede ser desconocido. Sin reenvío automático.|Dejar de seguir|Dispositivo seleccionado|No requiere argumentos|Tarea guardada|Sin coincidencias"
+    "fr" -> "Serveur local actif|Serveur local arrêté|Vérifier à nouveau|Dernière vérification chiffrée|Réponse reçue|Code d’erreur|Temps aller-retour (ms)|Rechercher dans cette page|Schéma d’entrée|Consultation seule : exécution indisponible|Demander les informations système|Lit uniquement les informations OS et Python de l’appareil choisi. Un nouvel UUID est enregistré avant l’envoi. En attente ne signifie pas réussite. Si le résultat est incertain, consultez la tâche sans la renvoyer.|Actualiser la tâche|UUID enregistré ; résultat éventuellement inconnu. Aucun renvoi automatique.|Arrêter le suivi|Appareil sélectionné|Aucun argument requis|Tâche enregistrée|Aucun résultat"
+    "zh" -> "本地服务器运行中|本地服务器已停止|重新验证|上次加密验证|已收到响应|错误代码|往返耗时（毫秒）|搜索本页|输入架构|仅查看：不可执行|请求系统信息|仅读取所选设备的操作系统和 Python 信息。发送前保存新的 UUID。排队不代表成功。结果不明确时仅刷新任务，不要重新发送。|刷新任务|UUID 已保存，结果可能未知。不会自动重发。|结束跟踪|所选设备|无需参数|已保存的任务|无匹配项"
+    "hi" -> "स्थानीय सर्वर चालू|स्थानीय सर्वर बंद|फिर जाँचें|पिछली एन्क्रिप्टेड जाँच|उत्तर मिला|त्रुटि कोड|आने-जाने का समय (मिलीसेकंड)|इस पृष्ठ पर खोजें|इनपुट स्कीमा|केवल देखें: चलाना उपलब्ध नहीं|सिस्टम जानकारी माँगें|केवल चुने हुए डिवाइस के OS और Python तथ्य पढ़ता है। भेजने से पहले नया UUID सहेजा जाएगा। कतार में होना सफलता नहीं है। अनिश्चित परिणाम पर केवल कार्य की स्थिति पढ़ें, दोबारा न भेजें।|कार्य ताज़ा करें|UUID सहेजा गया; परिणाम अज्ञात हो सकता है। स्वतः दोबारा नहीं भेजेंगे।|निगरानी समाप्त करें|चुना हुआ डिवाइस|तर्क आवश्यक नहीं|सहेजा गया कार्य|कोई मेल नहीं"
+    "ar" -> "الخادم المحلي يعمل|الخادم المحلي متوقف|إعادة الفحص|آخر فحص مشفر|تم استلام الرد|رمز الخطأ|زمن الذهاب والعودة (مللي ثانية)|بحث في هذه الصفحة|مخطط الإدخال|للعرض فقط: التنفيذ غير متاح|طلب معلومات النظام|يقرأ فقط معلومات نظام التشغيل وPython للجهاز المحدد. يحفظ UUID جديداً قبل الإرسال. الانتظار لا يعني النجاح. إذا كانت النتيجة غير مؤكدة فحدّث المهمة فقط ولا تعاود الإرسال.|تحديث المهمة|تم حفظ UUID؛ قد تكون النتيجة مجهولة. لا إعادة إرسال تلقائية.|إنهاء التتبع|الجهاز المحدد|لا تتطلب معاملات|المهمة المحفوظة|لا نتائج"
+    else -> "Local server running|Local server stopped|Check again|Last encrypted check|Reply received|Error code|Round-trip elapsed (ms)|Search this page|Input schema|View only: execution unavailable|Request system information|Only reads OS and Python facts on the selected device. A new UUID will be saved before sending. Queued does not mean succeeded. If the outcome is uncertain, only refresh the task; do not resubmit.|Refresh task|UUID saved; outcome may be unknown. No automatic replay.|Finish tracking|Selected device|No arguments required|Saved task|No matches"
+}).split('|'))
+
+private fun v2SafeCode(value: String?): String? = value?.takeIf { Regex("[A-Za-z][A-Za-z0-9_.-]{0,127}").matches(it) }
+
+/** Fail closed: only the known low-risk PC operation, with its exact zero-argument contract. */
+private fun v2SystemInfo(entry: JSONObject): Boolean {
+    if (entry.opt("name") != "pc.system.info" || entry.opt("read_only") != true) return false
+    val schema = entry.optJSONObject("input_schema") ?: return false
+    val keys = schema.keys().asSequence().toSet()
+    return keys == setOf("type", "properties", "required", "additionalProperties") &&
+        schema.opt("type") == "object" && schema.optJSONObject("properties")?.length() == 0 &&
+        schema.optJSONArray("required")?.length() == 0 && schema.opt("additionalProperties") == false
+}
+
+private data class V2Diagnostic(val node: String, val address: String, val port: Int,
+    val elapsedMs: Long, val ok: Boolean, val code: String?)
 
 /** Focus outline supplements host glass buttons for keyboard and TV navigation. */
 @Composable
@@ -79,6 +112,9 @@ fun HomeV2Screen(node: HomeV2Node, host: ScreenHost,
     pairing: org.amalia.unifiedhome.v2.HomeV2Pairing? = null, membershipChanged: suspend () -> Unit) {
     val language = LocalConfiguration.current.locales[0].language
     val copy = remember(language) { v2Copy(language) }
+    val tools = remember(language) { v2ToolsCopy(language) }
+    // Only public home/device IDs and task UUIDs; never invitations, payloads or results.
+    val preferences = LocalContext.current.applicationContext.getSharedPreferences("home_v2_ui_tasks", 0)
     val status by node.status.collectAsStateWithLifecycle()
     val peers by node.peers.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
@@ -89,39 +125,80 @@ fun HomeV2Screen(node: HomeV2Node, host: ScreenHost,
     var address by remember { mutableStateOf("") }
     var port by remember { mutableStateOf("47655") }
     var selected by remember { mutableStateOf<String?>(null) }
-    var taskId by remember { mutableStateOf("") }
-    var catalogue by remember { mutableStateOf<org.json.JSONObject?>(null) }
-    var task by remember { mutableStateOf<org.json.JSONObject?>(null) }
     var busy by remember { mutableStateOf(false) }
-    var failed by remember { mutableStateOf(false) }
-    val peer = peers.firstOrNull { it.nodeId == selected && it.authenticated }
+    val peer = peers.firstOrNull { it.nodeId == selected && it.homeId == status.homeId && it.authenticated }
+    val contextToken = remember(status.homeId, selected, peer?.address, peer?.port) { Any() }
+    var failed by remember(contextToken) { mutableStateOf(false) }
+    val currentToken = rememberUpdatedState(contextToken)
+    var taskId by remember(contextToken) { mutableStateOf("") }
+    var catalogue by remember(contextToken) { mutableStateOf<JSONObject?>(null) }
+    var task by remember(contextToken) { mutableStateOf<JSONObject?>(null) }
+    var diagnostic by remember(contextToken) { mutableStateOf<V2Diagnostic?>(null) }
+    var query by remember(contextToken) { mutableStateOf("") }
+    var detail by remember(contextToken) { mutableStateOf<JSONObject?>(null) }
+    var submitConfirmation by remember(contextToken) { mutableStateOf(false) }
+    var savedTask by remember(contextToken) { mutableStateOf<String?>(null) }
+    var trackingLoaded by remember(contextToken) { mutableStateOf(false) }
+    val trackingKey = status.homeId?.let { home -> selected?.let { "$home.$it" } }
+    LaunchedEffect(contextToken) {
+        try {
+            val id = trackingKey?.let { withContext(Dispatchers.IO) { preferences.getString(it, null) } }
+            check(id == null || id.matches(Regex("[0-9a-f]{32}")))
+            if (currentToken.value === contextToken) {
+                savedTask = id; taskId = id.orEmpty(); trackingLoaded = true
+            }
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { if (currentToken.value === contextToken) failed = true }
+    }
     fun action(block: suspend () -> Unit) {
         if (busy) return
         busy = true; failed = false
+        val token = contextToken
         scope.launch {
-            try { withContext(Dispatchers.IO) { block() } }
+            try { block() }
             catch (cancelled: CancellationException) { throw cancelled }
-            catch (_: Exception) { failed = true }
+            catch (_: Exception) { if (currentToken.value === token) failed = true }
             finally { busy = false }
         }
     }
-    suspend fun request(operation: String, args: org.json.JSONObject): org.json.JSONObject {
-        val trusted = peer ?: error("no_peer")
+    suspend fun request(trusted: HomeV2Peer, operation: String, args: JSONObject): JSONObject {
+        val token = contextToken
+        if (currentToken.value !== token || node.status.value.homeId != trusted.homeId) throw CancellationException("selection_changed")
+        val start = SystemClock.elapsedRealtime()
         val result = node.request(trusted.address, trusted.port, trusted.nodeId, operation, args)
-        check(result.ok)
+        val elapsed = SystemClock.elapsedRealtime() - start
+        if (currentToken.value !== token || node.status.value.homeId != trusted.homeId) throw CancellationException("selection_changed")
+        if (!result.ok) {
+            diagnostic = V2Diagnostic(trusted.nodeId, trusted.address, trusted.port, elapsed, false, v2SafeCode(result.error))
+            error("request_failed")
+        }
+        if (operation == "tasks.get" || operation == "tasks.submit") {
+            check(result.data.optString("task_id") == args.optString("task_id"))
+        }
         return result.data
+    }
+    fun checkLink(id: String, route: String, routePort: Int) {
+        val home = status.homeId
+        diagnostic = null
+        action {
+            val start = SystemClock.elapsedRealtime()
+            val result = node.request(route, routePort, id, "node.describe")
+            val elapsed = SystemClock.elapsedRealtime() - start
+            if (node.status.value.homeId == home && currentToken.value === contextToken) {
+                diagnostic = V2Diagnostic(id, route, routePort, elapsed, result.ok, v2SafeCode(result.error))
+            }
+        }
     }
     // No secret in saved state, no automatic export, and clear export on route disposal/backgrounding.
     val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
     DisposableEffect(lifecycle) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP) { exported = null; invite = ""; confirmation = null }
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP) { exported = null; invite = ""; confirmation = null; submitConfirmation = false }
         }
         lifecycle.addObserver(observer)
         onDispose { lifecycle.removeObserver(observer); exported = null; invite = "" }
     }
-    LaunchedEffect(status.homeId) { exported = null; selected = null; catalogue = null; task = null }
-    LaunchedEffect(selected) { catalogue = null; task = null; taskId = "" }
+    LaunchedEffect(status.homeId) { exported = null; selected = null; catalogue = null; task = null; failed = false }
     AmaliaScreen(title = copy[0], onBack = host::goBack, backLabel = copy[1]) { insets ->
         LazyColumn(contentPadding = insets, modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
             if (pairing != null) item("automatic-pairing") {
@@ -135,7 +212,7 @@ fun HomeV2Screen(node: HomeV2Node, host: ScreenHost,
                     Text(if (status.homeId == null) copy[11] else "${copy[12]} · ${status.homeId}", style = MaterialTheme.typography.bodyLarge)
                     Text("${copy[13]} · ${node.deviceName}", style = MaterialTheme.typography.bodyLarge)
                     Text(status.nodeId, style = MaterialTheme.typography.bodyMedium)
-                    Text(if (status.running) copy[14] else copy[15], style = MaterialTheme.typography.bodyMedium)
+                    Text(if (status.running) tools[0] else tools[1], style = MaterialTheme.typography.bodyMedium)
                     if (status.homeId == null) {
                         V2Field(copy[4], invite, secret = true) { invite = it }
                         V2Button(copy[2], !busy) { confirmation = "create" }
@@ -176,45 +253,114 @@ fun HomeV2Screen(node: HomeV2Node, host: ScreenHost,
                     V2Field(copy[20], address) { address = it }
                     V2Field(copy[21], port) { port = it }
                     V2Button(copy[22], !busy && target.matches(Regex("[0-9a-f]{32}")) && (port.toIntOrNull() ?: 0) in 1..65535 && address.isNotBlank()) {
-                        action { val result = node.request(address.trim(), port.toInt(), target, "node.describe")
-                            check(result.ok); selected = target }
+                        checkLink(target, address.trim(), port.toInt())
                     }
                 } }
-                items(peers, key = { it.nodeId }, contentType = { "peer" }) { candidate ->
+                items(peers.sortedByDescending { it.authenticated }.distinctBy { it.nodeId }, key = { it.nodeId }, contentType = { "peer" }) { candidate ->
                     GlassCard(contentPadding = Spacing.md) {
                         Text(candidate.name.ifBlank { candidate.platform.ifBlank { copy[19] } }, style = MaterialTheme.typography.bodyLarge)
                         Text("${candidate.nodeId} · ${candidate.address}:${candidate.port}", style = MaterialTheme.typography.bodyMedium)
                         Text(if (candidate.authenticated) copy[23] else copy[24], style = MaterialTheme.typography.bodyMedium)
                         V2Button(if (candidate.authenticated) copy[38] else copy[22], !busy) {
-                            if (candidate.authenticated) selected = candidate.nodeId else action {
-                                val result = node.request(candidate.address, candidate.port, candidate.nodeId, "node.describe")
-                                check(result.ok); selected = candidate.nodeId
-                            }
+                            if (candidate.authenticated) selected = candidate.nodeId
+                            else checkLink(candidate.nodeId, candidate.address, candidate.port)
                         }
                     }
                 }
+                diagnostic?.let { result -> item("link-result") { GlassCard(contentPadding = Spacing.md) {
+                    SectionTitle(tools[3])
+                    Text("${result.node} · ${result.address}:${result.port}", style = MaterialTheme.typography.bodyMedium)
+                    Text(if (result.ok) tools[4] else copy[31], style = MaterialTheme.typography.bodyMedium)
+                    Text("${tools[6]} · ${result.elapsedMs}", style = MaterialTheme.typography.bodyMedium)
+                    result.code?.let { Text("${tools[5]} · $it", style = MaterialTheme.typography.bodyMedium) }
+                } } }
                 if (peer != null) item("peer-data") { GlassCard(contentPadding = Spacing.md) {
-                    Text(peer.nodeId, style = MaterialTheme.typography.bodyLarge)
+                    SectionTitle(tools[15])
+                    Text(peer.name.ifBlank { peer.nodeId }, style = MaterialTheme.typography.bodyLarge)
+                    Text("${peer.nodeId} · ${peer.address}:${peer.port}", style = MaterialTheme.typography.bodyMedium)
+                    V2Button(tools[2], !busy) { checkLink(peer.nodeId, peer.address, peer.port) }
                     SectionTitle(copy[25])
-                    V2Button(copy[26], !busy) { action { catalogue = request("capabilities.list", org.json.JSONObject()) } }
+                    V2Button(copy[26], !busy) { detail = null; submitConfirmation = false
+                        action { catalogue = request(peer, "capabilities.list", org.json.JSONObject()) } }
                     val entries = catalogue?.optJSONArray("capabilities")
                     if (catalogue != null) Text(copy[33], style = MaterialTheme.typography.bodyMedium)
+                    V2Field(tools[7], query) { query = it }
                     if (entries != null) {
                         if (entries.length() == 0) Text(copy[34], style = MaterialTheme.typography.bodyMedium)
-                        for (i in 0 until entries.length()) {
-                            // Only capability identity, never arbitrary descriptions, results or secret-bearing payloads.
-                            Text("${copy[36]} · ${entries.optJSONObject(i)?.optString("name").orEmpty()}", style = MaterialTheme.typography.bodyMedium)
+                        val matches = (0 until entries.length()).mapNotNull { entries.optJSONObject(it) }
+                            .filter { it.optString("name").contains(query.trim(), ignoreCase = true) }
+                        if (entries.length() > 0 && matches.isEmpty()) Text(tools[18], style = MaterialTheme.typography.bodyMedium)
+                        matches.forEach { entry ->
+                            val name = entry.optString("name").take(128).filterNot { it.isISOControl() }
+                            V2Button("${copy[36]} · $name", !busy) { detail = entry; submitConfirmation = false }
+                        }
+                    }
+                    detail?.let { entry ->
+                        Text(entry.optString("name").take(128).filterNot { it.isISOControl() }, style = MaterialTheme.typography.bodyLarge)
+                        Text(tools[8], style = MaterialTheme.typography.labelLarge)
+                        // Schema only, bounded for layout; never display arbitrary provider descriptions or results.
+                        Text(entry.optJSONObject("input_schema")?.toString()?.take(2000).orEmpty(), style = MaterialTheme.typography.bodyMedium)
+                        val eligible = v2SystemInfo(entry)
+                        Text(if (eligible) tools[16] else tools[9], style = MaterialTheme.typography.bodyMedium)
+                        if (eligible) V2Button(tools[10], !busy && trackingLoaded && savedTask == null) { submitConfirmation = true }
+                        if (submitConfirmation && eligible) {
+                            Text(tools[11], style = MaterialTheme.typography.bodyMedium)
+                            Text("${peer.nodeId} · pc.system.info", style = MaterialTheme.typography.bodyMedium)
+                            V2Button(copy[8], !busy && savedTask == null && trackingLoaded) {
+                                val trusted = peer
+                                val key = trackingKey
+                                val token = contextToken
+                                val id = UUID.randomUUID().toString().replace("-", "")
+                                submitConfirmation = false
+                                action {
+                                    check(key != null)
+                                    // Fail closed on a storage error; do not allocate another UUID in this view.
+                                    trackingLoaded = false
+                                    // Durable BEFORE first send. On cancellation/timeout, never submit this record again.
+                                    check(withContext(Dispatchers.IO) { preferences.edit().putString(key, id).commit() })
+                                    if (currentToken.value !== token) throw CancellationException("selection_changed")
+                                    trackingLoaded = true; savedTask = id; taskId = id; task = null
+                                    task = request(trusted, "tasks.submit", JSONObject().put("task_id", id)
+                                        .put("capability", "pc.system.info").put("arguments", JSONObject()))
+                                }
+                            }
+                            V2Button(copy[9], !busy) { submitConfirmation = false }
                         }
                     }
                     val cursor = catalogue?.opt("next_cursor") as? String
                     if (!cursor.isNullOrEmpty()) V2Button(copy[27], !busy) {
-                        action { catalogue = request("capabilities.list", org.json.JSONObject().put("cursor", cursor)) }
+                        detail = null; submitConfirmation = false
+                        action { catalogue = request(peer, "capabilities.list", org.json.JSONObject().put("cursor", cursor)) }
                     }
-                    SectionTitle(copy[28]); V2Field(copy[29], taskId) { taskId = it }
+                    SectionTitle(copy[28])
+                    savedTask?.let { id ->
+                        Text("${tools[17]} · $id", style = MaterialTheme.typography.bodyMedium)
+                        Text(tools[13], style = MaterialTheme.typography.bodyMedium)
+                        V2Button(tools[12], !busy) { taskId = id; task = null
+                            action { task = request(peer, "tasks.get", JSONObject().put("task_id", id)) }
+                        }
+                    }
+                    if (!busy) V2Field(copy[29], taskId) { taskId = it; task = null }
+                    else Text("${copy[29]} · $taskId", style = MaterialTheme.typography.bodyMedium)
                     V2Button(copy[30], !busy && taskId.matches(Regex("[0-9a-f]{32}"))) {
-                        action { task = request("tasks.get", org.json.JSONObject().put("task_id", taskId)) }
+                        val id = taskId; task = null
+                        action { task = request(peer, "tasks.get", org.json.JSONObject().put("task_id", id)) }
                     }
-                    task?.let { Text("${copy[37]} · ${v2TaskState(it.optString("state"), language)}", style = MaterialTheme.typography.bodyMedium) }
+                    task?.let { result ->
+                        Text("${copy[37]} · ${v2TaskState(result.optString("state"), language)}", style = MaterialTheme.typography.bodyMedium)
+                        v2SafeCode(result.opt("error") as? String ?: result.opt("error_code") as? String)?.let {
+                            Text("${tools[5]} · $it", style = MaterialTheme.typography.bodyMedium)
+                        }
+                        if (result.optString("task_id") == savedTask && result.optString("state") in setOf("succeeded", "error", "cancelled")) {
+                            V2Button(tools[14], !busy) { val key = trackingKey; val token = contextToken
+                                action {
+                                    check(key != null)
+                                    check(withContext(Dispatchers.IO) { preferences.edit().remove(key).commit() })
+                                    if (currentToken.value === token) { savedTask = null; taskId = ""; task = null }
+                                }
+                            }
+                        }
+                    }
                 } }
             }
         }

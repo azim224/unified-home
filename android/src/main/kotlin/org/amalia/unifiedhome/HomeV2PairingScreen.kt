@@ -47,6 +47,19 @@ private fun pairingCopy(language: String): List<String> = (when (language) {
     else -> "Approved — waiting for the joining device…"
 }
 
+
+private fun completionCopy(language: String): List<String> = (when (language) {
+    "ru" -> "Подключение завершено — устройство сохранило членство.|Дом сохранён; подтверждение завершения от хоста не получено.|Закрыть"
+    "de" -> "Kopplung abgeschlossen — Gerät hat die Mitgliedschaft gespeichert.|Zuhause gespeichert; Abschluss vom Host nicht bestätigt.|Schließen"
+    "es" -> "Vinculación completada — el dispositivo guardó la membresía.|Hogar guardado; el anfitrión no confirmó la finalización.|Cerrar"
+    "fr" -> "Association terminée — l’appareil a enregistré son adhésion.|Maison enregistrée ; fin non confirmée par l’hôte.|Fermer"
+    "ja" -> "接続完了 — 端末にメンバーシップが保存されました。|ホームは保存済みです。ホストによる完了確認は未受信です。|閉じる"
+    "zh" -> "配对完成 — 设备已保存成员资格。|家庭已保存；尚未收到主机的完成确认。|关闭"
+    "hi" -> "जोड़ना पूरा हुआ — डिवाइस ने सदस्यता सहेज ली है।|घर सहेजा गया; होस्ट से पूर्ण होने की पुष्टि नहीं मिली।|बंद करें"
+    "ar" -> "اكتمل الإقران — حفظ الجهاز العضوية.|تم حفظ المنزل؛ لم يؤكد المضيف اكتمال الإقران.|إغلاق"
+    else -> "Pairing completed — device saved membership.|Home saved; completion not confirmed by the host.|Dismiss"
+}).split('|')
+
 @Composable
 private fun PairingButton(label: String, enabled: Boolean = true, onClick: () -> Unit) {
     var focused by remember { mutableStateOf(false) }
@@ -63,6 +76,7 @@ private class PairingAttempt(val name: String) {
     var code by mutableStateOf<String?>(null)
     var compared by mutableStateOf(false)
     var active = true
+    var completing = false
     var job: Job? = null
 }
 
@@ -70,11 +84,13 @@ private class PairingAttempt(val name: String) {
 fun HomeV2PairingPanel(pairing: HomeV2Pairing, joined: Boolean, onJoin: suspend (String) -> Unit) {
     val language = LocalConfiguration.current.locales[0].language
     val copy = remember(language) { pairingCopy(language) }
+    val completion = remember(language) { completionCopy(language) }
     val peers by pairing.peers.collectAsStateWithLifecycle()
     val status by pairing.status.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
     val latestJoin by rememberUpdatedState(onJoin)
     var attempt by remember(pairing) { mutableStateOf<PairingAttempt?>(null) }
+    var joinedConfirmation by remember(pairing) { mutableStateOf<Boolean?>(null) }
     var error by remember(pairing) { mutableStateOf<Int?>(null) }
     var errorCode by remember(pairing) { mutableStateOf<String?>(null) }
 
@@ -105,7 +121,8 @@ fun HomeV2PairingPanel(pairing: HomeV2Pairing, joined: Boolean, onJoin: suspend 
         onDispose { attempt?.let { cancelClient(it) } }
     }
     LaunchedEffect(joined) {
-        if (joined) attempt?.let { cancelClient(it) }
+        if (joined) attempt?.takeUnless { it.completing }?.let { cancelClient(it) }
+        else joinedConfirmation = null
     }
     val client = attempt
     LaunchedEffect(client, client?.compared) {
@@ -121,7 +138,15 @@ fun HomeV2PairingPanel(pairing: HomeV2Pairing, joined: Boolean, onJoin: suspend 
                 invitation
             }
             if (invitation == null) error = 21
-            else if (client.active) latestJoin(invitation)
+            else if (client.active) {
+                val receipt = pairing.captureReceipt()
+                // Membership updates may cancel/reset pairing. Retain this local snapshot,
+                // and do not let the joined-state effect abort persistence/acknowledgement.
+                client.completing = true
+                latestJoin(invitation)
+                joinedConfirmation = false
+                joinedConfirmation = pairing.acknowledge(receipt)
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Exception) {
@@ -137,22 +162,24 @@ fun HomeV2PairingPanel(pairing: HomeV2Pairing, joined: Boolean, onJoin: suspend 
             Text(copy[22], style = MaterialTheme.typography.bodyMedium)
             if (joined) {
                 Text(when {
+                    status.completed -> completion[0]
                     status.approved -> copy[23]
                     status.pendingName != null -> copy[5]
                     status.open -> copy[2]
                     else -> copy[3]
                 }, style = MaterialTheme.typography.bodyMedium)
                 PairingButton(copy[1], !status.open && status.pendingName == null) { hostAction { pairing.openWindow() } }
+                joinedConfirmation?.let { Text(completion[if (it) 0 else 1], style = MaterialTheme.typography.bodyMedium) }
                 val pendingName = status.pendingName
                 val hostCode = status.code
                 if (pendingName != null) {
                     Text("${copy[4]} · $pendingName", style = MaterialTheme.typography.bodyLarge)
-                    if (!hostCode.isNullOrBlank()) {
+                    if (!status.completed && !hostCode.isNullOrBlank()) {
                         Text("${copy[5]} · $hostCode", style = MaterialTheme.typography.headlineSmall)
                         Text(copy[6], style = MaterialTheme.typography.bodyMedium)
                     }
-                    PairingButton(copy[7], !status.approved && !hostCode.isNullOrBlank()) { hostAction { pairing.approve() } }
-                    PairingButton(copy[8]) { hostAction { pairing.reject() } }
+                    if (!status.completed) PairingButton(copy[7], !status.approved && !hostCode.isNullOrBlank()) { hostAction { pairing.approve() } }
+                    PairingButton(if (status.completed) completion[2] else copy[8]) { hostAction { pairing.reject() } }
                 }
             }
             if (error != null || status.error != null) {
@@ -173,7 +200,7 @@ fun HomeV2PairingPanel(pairing: HomeV2Pairing, joined: Boolean, onJoin: suspend 
                     if (client.compared) Text(copy[18], style = MaterialTheme.typography.bodyMedium)
                     else PairingButton(copy[17]) { client.compared = true }
                 }
-                PairingButton(copy[19]) { cancelClient(client) }
+                PairingButton(copy[19], !client.completing) { cancelClient(client) }
             }
         }
         GlassCard(contentPadding = Spacing.md) {

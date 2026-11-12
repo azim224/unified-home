@@ -10,6 +10,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -43,6 +44,7 @@ import java.security.spec.ECParameterSpec
 import java.security.spec.ECFieldFp
 import java.security.spec.X509EncodedKeySpec
 import javax.crypto.Cipher
+import javax.crypto.Mac
 import javax.crypto.KeyAgreement
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -55,7 +57,7 @@ data class PairingPeer(
 data class PairingStatus(
     val open: Boolean = false, val code: String? = null,
     val pendingName: String? = null, val error: String? = null,
-    val approved: Boolean = false,
+    val approved: Boolean = false, val completed: Boolean = false,
 )
 
 /** Local-human-only SAS pairing. Discovery is untrusted; compare both displayed codes before
@@ -81,6 +83,7 @@ class HomeV2Pairing(
     private var offerCount = 0
     private var incoming: Incoming? = null
     private var outgoing: Outgoing? = null
+    private var receipt: Receipt? = null
     private var actionEpoch = 0L
     private val candidates = LinkedHashMap<String, Seen>()
 
@@ -96,12 +99,28 @@ class HomeV2Pairing(
         val session: String, val invitation: String, val key: ByteArray,
         val transcript: ByteArray, val deadline: Long,
         var delivered: JSONObject? = null, var deliveredUntil: Long = 0,
+        var completed: Boolean = false,
     )
     private class Outgoing(val peer: PairingPeer, val initialInvitation: String?, var deadline: Long) {
         var session: String? = null
         var key: ByteArray? = null
         var transcript: ByteArray? = null
         var socket: Socket? = null
+    }
+
+    /** Opaque LOCAL immutable capability. Never serialize or log its contents. */
+    class Receipt internal constructor(
+        private val owner: HomeV2Pairing, private val node: String,
+        internal val address: String, internal val session: String,
+        key: ByteArray, transcript: ByteArray, private val invitation: String,
+        private val deadline: Long,
+    ) {
+        private val key = key.copyOf()
+        private val transcript = transcript.copyOf()
+        internal fun matches(owner: HomeV2Pairing, node: String, invitation: String?, time: Long) =
+            this.owner === owner && this.node == node && this.invitation == invitation && time < deadline
+        internal fun alive(time: Long) = time < deadline
+        internal fun proof(): ByteArray = joinedProof(key, transcript)
     }
 
     init { v2Id(nodeId); printable(name) }
@@ -164,6 +183,7 @@ class HomeV2Pairing(
     private fun shutdown(r: Runtime) = synchronized(lock) {
         if (runtime !== r) return@synchronized
         runtime = null
+        receipt = null
         clearPairing()
         candidates.clear(); mutablePeers.value = emptyList()
         r.udp.close(); r.tcp.close()
@@ -245,6 +265,7 @@ class HomeV2Pairing(
                 v2Require(outgoing == null && incoming == null && windowUntil == 0L, "pairing_busy")
                 val initial = invitation()
                 v2Require(initial == null, "already_joined")
+                receipt = null
                 p = Outgoing(peer, initial, now() + WINDOW); outgoing = p
             }
             try {
@@ -318,6 +339,9 @@ class HomeV2Pairing(
                         .decode(ByteBuffer.wrap(cipher.doFinal(encrypted))).toString()
                     v2Require(home(text) == p.peer.homeId, "invalid_invitation")
                     v2Require(invitation() == p.initialInvitation, "membership_changed")
+                    // Snapshot BEFORE clearPairing zeroes the outgoing key.
+                    receipt = Receipt(this@HomeV2Pairing, nodeId, p.peer.address, p.session!!,
+                        p.key!!, p.transcript!!, text, p.deadline)
                     clearPairing()
                     text
                 }
@@ -332,11 +356,62 @@ class HomeV2Pairing(
         }
     }
 
+    /** Capture after finish(), BEFORE persisting membership (which may cancel pairing). */
+    fun captureReceipt(): Receipt = synchronized(lock) {
+        receipt?.takeIf { it.alive(now()) } ?: throw HomeV2Exception("pairing_expired")
+    }
+
+    /** Call only AFTER membership was durably saved. False = joined, completion unconfirmed.
+     * Unsupported old hosts and transport failures never turn a successful join into failure. */
+    suspend fun acknowledge(receipt: Receipt): Boolean = withContext(Dispatchers.IO) {
+        fun valid() = synchronized(lock) {
+            receipt.matches(this@HomeV2Pairing, nodeId, invitation(), now())
+        }
+        try {
+            repeat(3) { attempt ->
+                if (!valid()) return@withContext false
+                try {
+                    val response = receiptExchange(receipt, JSONObject().put("op", "ack")
+                        .put("session", receipt.session).put("proof", b64(receipt.proof())))
+                    remoteError(response)
+                    v2Keys(response, setOf("op", "session"))
+                    return@withContext valid() && v2String(response, "op") == "ack" &&
+                        v2String(response, "session") == receipt.session
+                } catch (e: CancellationException) { throw e }
+                catch (_: HomeV2Exception) { return@withContext false }
+                catch (_: Exception) { /* Retry transport failures only; ack is idempotent. */ }
+                if (attempt < 2) delay(200)
+            }
+            false
+        } catch (e: CancellationException) { throw e }
+        catch (_: Exception) { false }
+    }
+
+    // Independent of outgoing/runtime: saving membership cancels the original pairing.
+    private suspend fun receiptExchange(receipt: Receipt, request: JSONObject): JSONObject = coroutineScope {
+        val socket = Socket()
+        val timeout = launch { delay(5000); runCatching { socket.close() } }
+        val cancellation = launch(start = CoroutineStart.UNDISPATCHED) {
+            try { awaitCancellation() } finally { runCatching { socket.close() } }
+        }
+        try {
+            socket.soTimeout = 5000
+            socket.connect(InetSocketAddress(ipv4(receipt.address), PORT), 5000)
+            write(socket, request)
+            read(socket)
+        } finally {
+            cancellation.cancel(); timeout.cancel(); runCatching { socket.close() }
+        }
+    }
+
     private fun maintain() {
         val time = now()
+        if (receipt?.alive(time) == false) receipt = null
         if ((windowUntil != 0L && time >= windowUntil) ||
             (incoming?.let { time >= if (it.delivered == null) it.deadline else it.deliveredUntil } == true) ||
-            (outgoing?.let { time >= it.deadline } == true)) clearPairing("pairing_expired")
+            (outgoing?.let { time >= it.deadline } == true)) {
+            clearPairing(if (incoming?.completed == true) null else "pairing_expired")
+        }
         // An unused offer expires independently; the human-opened window stays open.
         if (offer?.let { time >= it.deadline } == true) offer = null
         val expected = incoming?.invitation ?: offer?.invitation ?: windowInvitation
@@ -434,6 +509,7 @@ class HomeV2Pairing(
                                 "offer" -> offer(request)
                                 "hello" -> hello(request)
                                 "poll" -> poll(request)
+                                "ack" -> ack(request)
                                 else -> throw HomeV2Exception("invalid_request")
                             }
                         }
@@ -503,6 +579,22 @@ class HomeV2Pairing(
         v2Require(MessageDigest.isEqual(token.toByteArray(Charsets.US_ASCII), p.session.toByteArray(Charsets.US_ASCII)), "invalid_session")
         v2Require(invitation() == p.invitation, "membership_changed")
         return p.delivered ?: JSONObject().put("op", "pending")
+    }
+
+    private fun ack(request: JSONObject): JSONObject {
+        v2Keys(request, setOf("op", "session", "proof"))
+        val token = v2Id(v2String(request, "session"))
+        val proof = decode(v2String(request, "proof")); v2Require(proof.size == 32)
+        val p = incoming ?: throw HomeV2Exception("invalid_session")
+        v2Require(MessageDigest.isEqual(token.toByteArray(Charsets.US_ASCII),
+            p.session.toByteArray(Charsets.US_ASCII)), "invalid_session")
+        v2Require(p.delivered != null, "invalid_session")
+        v2Require(invitation() == p.invitation, "membership_changed")
+        v2Require(MessageDigest.isEqual(proof, joinedProof(p.key, p.transcript)), "invalid_request")
+        // Keep the delivery and original expiry so a lost ack response can be retried.
+        p.completed = true
+        mutableStatus.value = mutableStatus.value.copy(completed = true, error = null)
+        return JSONObject().put("op", "ack").put("session", token)
     }
 
     private suspend fun exchange(r: Runtime, p: Outgoing, request: JSONObject): JSONObject {
@@ -613,6 +705,10 @@ class HomeV2Pairing(
             agreement.init(pair.private); agreement.doPhase(key, true)
             val secret = agreement.generateSecret()
             return try { MessageDigest.getInstance("SHA-256").digest(secret + transcript) } finally { secret.fill(0) }
+        }
+        fun joinedProof(key: ByteArray, transcript: ByteArray): ByteArray = Mac.getInstance("HmacSHA256").run {
+            init(SecretKeySpec(key, "HmacSHA256"))
+            doFinal(transcript + "\njoined".toByteArray(Charsets.US_ASCII))
         }
         fun sas(key: ByteArray): String {
             val bytes = MessageDigest.getInstance("SHA-256").digest(key + "sas".toByteArray(Charsets.US_ASCII))
