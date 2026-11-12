@@ -5,6 +5,8 @@ import android.database.sqlite.SQLiteDatabase
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import com.my.amali.data.ai.FishAudioTTS
+import com.my.amali.data.ai.ModelCatalog
 import com.my.amali.plugin.HostServices
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -15,6 +17,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.Closeable
 import java.io.File
+import java.net.URI
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -310,7 +313,18 @@ class HomeV2Data(
         fields(a, setOf("id", "label", "expected_revision"))
         val adapter = settingsAdapter ?: throw HomeV2Exception("profile_apply_unavailable")
         val exported = adapter.exportProviderProfile()
-        val values = exported.getJSONObject("values")
+        // Raw host preferences only: resolve public request defaults, never effective/build keys.
+        val values = JSONObject(exported.getJSONObject("values").toString())
+        if (exported.getString("provider") == "groq") {
+            val model = ModelCatalog.resolveForRequest(ModelCatalog.Provider.GROQ, values.optString("chat_model"))
+            values.put("chat_model", model).put("groq_model", model)
+        }
+        values.put("assemblyai_model", ModelCatalog.resolveForRequest(
+            ModelCatalog.Provider.ASSEMBLY_AI, values.optString("assemblyai_model")))
+        values.put("fish_model", ModelCatalog.resolveForRequest(
+            ModelCatalog.Provider.FISH_AUDIO, values.optString("fish_model")))
+        values.put("fish_reference_id", values.optString("fish_reference_id").trim()
+            .ifBlank { FishAudioTTS.DEFAULT_REFERENCE_ID })
         val strings = JSONObject()
         values.keys().forEach { key -> strings.put(key, values.get(key).toString()) }
         return transaction { importProfile(JSONObject().put("id", a.getString("id"))
@@ -345,7 +359,9 @@ class HomeV2Data(
         val selected = state.optJSONObject("selected")
         if (selected != null && encode(selected, 1024) == encode(ref, 1024)) return state
         val values = transaction { profile(ref.getString("id"), ref.getLong("version")).getJSONObject("values") }
-        if (values.has("chat_api_key")) return applyFullProfile(adapter, state, ref, values)
+        if (values.keys().asSequence().any { it in COMMON_PROFILE_FIELDS || it in CHAT_ALIASES ||
+                it in setOf("fish_speed", "assemblyai_rest_model") })
+            return applyFullProfile(adapter, state, ref, values)
         val patch = nativePatch(values)
         // The host export is intentionally not exposed over RPC. Missing keys cannot be cleared by
         // the current patch-only host API, so refuse changes that cannot be backed up exactly.
@@ -412,22 +428,48 @@ class HomeV2Data(
     private suspend fun applyFullProfile(adapter: SettingsAdapter, before: JSONObject,
         ref: JSONObject, stored: JSONObject): JSONObject {
         val current = adapter.exportProviderProfile()
-        val values = JSONObject(stored.toString())
-        // Stored profile values are strings on both platforms; the canonical host
-        // envelope restores typed Android-only options before strict validation.
-        for (key in listOf("stt_silence_seconds", "tts_speed", "tts_pitch", "llm_temperature")) {
-            if (values.has(key)) values.put(key, values.getString(key).toDouble())
+        // Build a host-only envelope. PC-only fields stay in the encrypted stored version.
+        // Portable chat fields are authoritative after PC edits; omit ALL raw chat aliases
+        // so the host derives the active ones and leaves the disabled provider untouched.
+        val values = JSONObject()
+        stored.keys().forEach { key ->
+            if (key in PROFILE_FIELDS && key !in CHAT_ALIASES) values.put(key, stored.get(key))
+        }
+        for (key in COMMON_PROFILE_FIELDS) {
+            if (!values.has(key)) values.put(key, "")
+        }
+        if (stored.has("fish_speed")) values.put("tts_speed", stored.getString("fish_speed"))
+        // Older PC profiles put REST speech_model in the streaming field. Preserve only
+        // this non-secret Android setting; omitted credentials above are deliberately blank.
+        if ((values.getString("assemblyai_model").isBlank() && stored.has("assemblyai_rest_model")) ||
+            values.getString("assemblyai_model").trim().lowercase() in setOf("universal-2", "slam-1")) {
+            values.put("assemblyai_model", current.getJSONObject("values").optString("assemblyai_model"))
+        }
+        // Stored values are strings on both platforms; restore the host's strict types.
+        for (key in PROFILE_NUMBER_FIELDS) {
+            if (values.has(key)) {
+                val number = values.getString(key).toDoubleOrNull()
+                requireData(number != null && number.isFinite(), "unsupported_profile_values")
+                values.put(key, number)
+            }
         }
         if (values.has("custom_json_mode")) {
             val value = values.getString("custom_json_mode")
             requireData(value == "true" || value == "false", "unsupported_profile_values")
             values.put("custom_json_mode", value == "true")
         }
-        val base = values.optString("chat_base_url")
-        if (base.isNotBlank() && !base.trimEnd('/').endsWith("/chat/completions")) {
-            values.put("chat_base_url", base.trimEnd('/') + "/chat/completions")
+        val base = values.getString("chat_base_url")
+        val uri = if (base.isEmpty()) null else try {
+            URI(if ("://" in base) base else "https://$base")
+        } catch (_: java.net.URISyntaxException) { throw HomeV2Exception("unsupported_profile_values") }
+        val provider = if (uri?.host.equals("api.groq.com", ignoreCase = true)) "groq" else "custom"
+        if (base.isNotBlank()) {
+            // Insert the suffix into the path, not after a query, and never duplicate it.
+            val pathEnd = base.indexOfAny(charArrayOf('?', '#')).let { if (it < 0) base.length else it }
+            val endpoint = base.substring(0, pathEnd).trimEnd('/')
+            values.put("chat_base_url", (if (uri?.path.orEmpty().trimEnd('/').endsWith("/chat/completions"))
+                endpoint else "$endpoint/chat/completions") + base.substring(pathEnd))
         }
-        val provider = if (base.contains("api.groq.com/")) "groq" else "custom"
         val next = JSONObject(before.toString()).put("revision", increment(before.getLong("revision")))
             .put("previous", before.opt("selected") ?: JSONObject.NULL).put("selected", ref)
         val pending = JSONObject().put("before", before).put("after", next).put("backup", current)
@@ -559,6 +601,13 @@ class HomeV2Data(
         private const val MAX_INTEGER = Long.MAX_VALUE - 1
         private const val PAGE_BYTES = 48000
         private val KINDS = setOf("notes", "tags", "scenes", "schedules")
+        private val COMMON_PROFILE_FIELDS = setOf("chat_api_key", "chat_base_url", "chat_model",
+            "assemblyai_api_key", "assemblyai_model", "fish_api_key", "fish_model", "fish_reference_id")
+        private val CHAT_ALIASES = setOf("groq_api_key", "groq_model", "custom_api_key", "custom_model", "custom_endpoint")
+        private val PROFILE_NUMBER_FIELDS = setOf("stt_silence_seconds", "tts_speed", "tts_pitch", "llm_temperature")
+        // Mirrors SettingsRepository.parseHomeProviderProfile's allowed field contract.
+        private val PROFILE_FIELDS = COMMON_PROFILE_FIELDS + CHAT_ALIASES + PROFILE_NUMBER_FIELDS +
+            setOf("assemblyai_base_url", "fish_base_url", "custom_json_mode")
         private val STRING_SETTINGS = setOf("llm_api_key", "stt_api_key", "tts_api_key", "llm_model", "stt_model", "tts_model", "tts_reference_id")
         private val NUMBER_SETTINGS = setOf("stt_silence_seconds", "tts_speed", "llm_temperature")
         private val NUMBER = Regex("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?")

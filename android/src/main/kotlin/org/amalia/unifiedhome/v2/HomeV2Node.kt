@@ -198,7 +198,7 @@ class HomeV2Node(context: Context, private val host: HostServices, private val s
     }
 
     private fun active(r: Runtime) = synchronized(lock) { runtime === r && r.job.isActive && store.membership === r.membership }
-    private fun features(): List<String> = listOf("node.describe") +
+    private fun features(): List<String> = listOf("node.describe", "device.state") +
         (if (host.homeCapabilityApiVersion >= 2) listOf("capabilities.list", "tasks.submit", "tasks.get") else emptyList()) + extensionOperations.sorted()
 
     /** Manual fallback accepts numeric IPv4/IPv6 only, no DNS/URLs; address is a route, never trust. */
@@ -388,6 +388,7 @@ class HomeV2Node(context: Context, private val host: HostServices, private val s
     private suspend fun dispatch(operation: String, args: JSONObject, home: String, from: String): JSONObject {
         val requester = "home.v3:$home:$from" // 73 chars; peer cannot select another task namespace.
         when (operation) {
+            "device.state" -> { v2Keys(args, emptySet()); return homeV2DeviceState(appContext, store.nodeId, label) }
             "node.describe" -> { v2Keys(args, emptySet()); return JSONObject().put("node", store.nodeId)
                 .put("name", label).put("platform", platform).put("api", 2).put("features", JSONArray(features())) }
             "capabilities.list" -> {
@@ -566,7 +567,7 @@ class HomeV2Node(context: Context, private val host: HostServices, private val s
 
     companion object {
         private val ERROR_CODE = Regex("[A-Za-z][A-Za-z0-9_.-]{0,127}")
-        private val BUILT_INS = setOf("node.describe", "capabilities.list", "tasks.submit", "tasks.get")
+        private val BUILT_INS = setOf("node.describe", "device.state", "capabilities.list", "tasks.submit", "tasks.get")
         private fun errorReply(code: String) = JSONObject().put("ok", false).put("data", JSONObject()).put("error", code)
         private fun closeQuietly(value: Closeable?) { try { value?.close() } catch (_: Exception) { /* cleanup only */ } }
     }
