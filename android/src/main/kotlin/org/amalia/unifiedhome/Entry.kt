@@ -68,7 +68,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
     override val metadata: PluginMetadata = PluginMetadata(
         id = "org.amalia.unifiedhome.native",
         name = "Единый дом",
-        version = "1.3.0",
+        version = "1.4.0",
         author = "Amalia",
         description = "Устройства, сцены с подтверждением и локальная сеть Амалии.",
         category = PluginCategory.SCREEN,
@@ -427,6 +427,12 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
                 })
         )
         return management + listOf(
+            ScreenSpec(
+                route = "amalia://screen/house-v2-notes", titleRes = 0,
+                title = homeV2NotesTitle(appContext?.resources?.configuration?.locales?.get(0)?.language.orEmpty()),
+                inNavigation = true, iconName = "lamp",
+                content = { host -> HomeV2Notes(homeV2, homeV2Data, host) },
+            ),
             ScreenSpec(
                 route = "amalia://screen/house-v2", titleRes = 0,
                 title = homeV2Title(appContext?.resources?.configuration?.locales?.get(0)?.language.orEmpty()), inNavigation = true, iconName = "lamp",
