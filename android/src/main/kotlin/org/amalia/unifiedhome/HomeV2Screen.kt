@@ -126,7 +126,8 @@ fun HomeV2Screen(node: HomeV2Node, host: ScreenHost, membershipChanged: suspend 
             item("membership") {
                 GlassCard(contentPadding = Spacing.md) {
                     Text(if (status.homeId == null) copy[11] else "${copy[12]} · ${status.homeId}", style = MaterialTheme.typography.bodyLarge)
-                    Text("${copy[13]} · ${status.nodeId}", style = MaterialTheme.typography.bodyMedium)
+                    Text("${copy[13]} · ${node.deviceName}", style = MaterialTheme.typography.bodyLarge)
+                    Text(status.nodeId, style = MaterialTheme.typography.bodyMedium)
                     Text(if (status.running) copy[14] else copy[15], style = MaterialTheme.typography.bodyMedium)
                     if (status.homeId == null) {
                         V2Field(copy[4], invite, secret = true) { invite = it }
@@ -174,7 +175,7 @@ fun HomeV2Screen(node: HomeV2Node, host: ScreenHost, membershipChanged: suspend 
                 } }
                 items(peers, key = { it.nodeId }, contentType = { "peer" }) { candidate ->
                     GlassCard(contentPadding = Spacing.md) {
-                        Text(candidate.name, style = MaterialTheme.typography.bodyLarge)
+                        Text(candidate.name.ifBlank { candidate.platform.ifBlank { copy[19] } }, style = MaterialTheme.typography.bodyLarge)
                         Text("${candidate.nodeId} · ${candidate.address}:${candidate.port}", style = MaterialTheme.typography.bodyMedium)
                         Text(if (candidate.authenticated) copy[23] else copy[24], style = MaterialTheme.typography.bodyMedium)
                         V2Button(if (candidate.authenticated) copy[38] else copy[22], !busy) {

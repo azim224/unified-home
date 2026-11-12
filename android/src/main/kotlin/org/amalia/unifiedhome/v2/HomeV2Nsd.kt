@@ -25,7 +25,8 @@ internal class HomeV2Nsd(
     private val node: String,
     private val home: String,
     private val platform: String,
-    private val candidate: (String, String, String, InetAddress, Int) -> Unit,
+    private val name: String,
+    private val candidate: (String, String, String, String, InetAddress, Int) -> Unit,
     private val status: (Boolean, Boolean, String?) -> Unit,
 ) {
     private val manager = context.getSystemService(Context.NSD_SERVICE) as? NsdManager
@@ -97,6 +98,7 @@ internal class HomeV2Nsd(
                 setAttribute("home", home)
                 setAttribute("node", node)
                 setAttribute("platform", platform)
+                setAttribute("name", name)
             }
             nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, registrationListener)
         } catch (_: Exception) { registration = null; report("nsd_registration_failed") }
@@ -143,7 +145,9 @@ internal class HomeV2Nsd(
                     v2Require(peerPlatform in setOf("pc", "android", "android_tv"))
                     val address = service.host ?: throw V2Failure("invalid_candidate")
                     v2Require(service.port in 1..65535)
-                    if (peer != node) candidate(peer, peerHome, peerPlatform, address, service.port)
+                    val peerName = if (service.attributes.containsKey("name")) text("name") else ""
+                    v2Require(peerName.none { it.isISOControl() })
+                    if (peer != node) candidate(peer, peerHome, peerPlatform, peerName, address, service.port)
                 } catch (_: Exception) { /* Untrusted TXT/address: never promote to authenticated peer. */ }
                 resolveNext()
             }

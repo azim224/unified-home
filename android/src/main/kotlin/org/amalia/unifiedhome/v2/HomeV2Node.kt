@@ -67,6 +67,7 @@ class HomeV2Node(context: Context, private val host: HostServices, private val s
     val peers: StateFlow<List<HomeV2Peer>> = mutablePeers.asStateFlow()
     private var extension: (suspend (String, JSONObject, String) -> JSONObject?)? = null
     private var extensionOperations: Set<String> = emptySet()
+    val deviceName: String get() = label
     private val label = Build.MODEL.orEmpty().filter { !it.isISOControl() }.take(80).ifBlank { "Android" }
     private val platform = if (context.packageManager.hasSystemFeature("android.software.leanback")) "android_tv" else "android"
 
@@ -145,12 +146,12 @@ class HomeV2Node(context: Context, private val host: HostServices, private val s
             mutableStatus.value = HomeV2Status(store.nodeId, r.membership?.home, tcpPort = port)
             mutableNetworkStatus.value = HomeV2NetworkStatus()
         }
-        r.nsd = HomeV2Nsd(appContext, store.nodeId, r.membership?.home ?: "", platform,
-            candidate = { node, home, peerPlatform, source, peerPort ->
+        r.nsd = HomeV2Nsd(appContext, store.nodeId, r.membership?.home ?: "", platform, label,
+            candidate = { node, home, peerPlatform, peerName, source, peerPort ->
                 // Convert only a numeric OS-provided address; no DNS or advertised hostname lookup.
                 val address = numericAddress(source.hostAddress ?: throw V2Failure("invalid_address"))
                 candidate(r, JSONObject().put("v", 3).put("type", "announce").put("node", node)
-                    .put("home", home).put("name", "").put("platform", peerPlatform).put("port", peerPort).put("api", 2), address)
+                    .put("home", home).put("name", peerName).put("platform", peerPlatform).put("port", peerPort).put("api", 2), address)
             },
             status = { discovering, registered, error -> synchronized(lock) {
                 if (runtime === r && r.job.isActive) {
@@ -230,7 +231,8 @@ class HomeV2Node(context: Context, private val host: HostServices, private val s
                     val data = response.body.opt("data") as? JSONObject ?: throw V2Failure("invalid_response")
                     val err = if (response.body.isNull("error")) null else v2String(response.body, "error")
                     v2Require((ok && err == null) || (!ok && err != null && ERROR_CODE.matches(err)), "invalid_response")
-                    markAuthenticated(r, to, m.home, route.hostAddress ?: address, port)
+                    markAuthenticated(r, to, m.home, route.hostAddress ?: address, port,
+                        if (ok && operation == "node.describe") data else null)
                     HomeV2Reply(ok, data, err)
                 } finally { closeQuietly(socket); r.sockets.remove(socket); deadline.cancel(); closer.cancel() }
             } catch (cancelled: CancellationException) { throw cancelled }
@@ -517,13 +519,27 @@ class HomeV2Node(context: Context, private val host: HostServices, private val s
             mutablePeers.value = rest + HomeV2Peer(node, home, name, platform, address, port, false, SystemClock.elapsedRealtime())
         }
     }
-    private fun markAuthenticated(r: Runtime, node: String, home: String, address: String, port: Int) {
+    private fun markAuthenticated(r: Runtime, node: String, home: String, address: String, port: Int, description: JSONObject?) {
+        val describedName = description?.let {
+            v2Require(it.optString("node") == node, "invalid_response")
+            val value = it.opt("name") as? String ?: throw V2Failure("invalid_response")
+            v2Require(value.length <= 80 && value.none { char -> char.isISOControl() }, "invalid_response")
+            value
+        }
+        val describedPlatform = description?.let {
+            val value = it.optString("platform")
+            v2Require(value in setOf("pc", "android", "android_tv"), "invalid_response")
+            value
+        }
         synchronized(lock) {
             if (runtime !== r || !r.job.isActive) return
             val previous = mutablePeers.value.find { it.nodeId == node && it.address == address && it.port == port }
             val rest = mutablePeers.value.filterNot { it.nodeId == node && it.address == address && it.port == port }.takeLast(127)
-            // UDP's display metadata stays candidate-only, not authenticated by an arbitrary RPC reply.
-            mutablePeers.value = rest + HomeV2Peer(node, home, "", "", address, port, true, SystemClock.elapsedRealtime())
+            // Only encrypted node.describe authenticates labels. Other RPCs keep previously
+            // authenticated labels, never promote UDP metadata to trusted identity.
+            val name = describedName ?: previous?.takeIf { it.authenticated }?.name.orEmpty()
+            val platform = describedPlatform ?: previous?.takeIf { it.authenticated }?.platform.orEmpty()
+            mutablePeers.value = rest + HomeV2Peer(node, home, name, platform, address, port, true, SystemClock.elapsedRealtime())
         }
     }
     private fun sendDatagram(socket: DatagramSocket, bytes: ByteArray, address: InetAddress, port: Int) {
