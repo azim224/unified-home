@@ -109,7 +109,7 @@ private fun V2Field(label: String, value: String, secret: Boolean = false, onCha
 
 @Composable
 fun HomeV2Screen(node: HomeV2Node, host: ScreenHost,
-    pairing: org.amalia.unifiedhome.v2.HomeV2Pairing? = null, membershipChanged: suspend () -> Unit) {
+    pairing: org.amalia.unifiedhome.v2.HomeV2Pairing? = null, section: String = "connection", membershipChanged: suspend () -> Unit) {
     val language = LocalConfiguration.current.locales[0].language
     val copy = remember(language) { v2Copy(language) }
     val tools = remember(language) { v2ToolsCopy(language) }
@@ -199,15 +199,15 @@ fun HomeV2Screen(node: HomeV2Node, host: ScreenHost,
         onDispose { lifecycle.removeObserver(observer); exported = null; invite = "" }
     }
     LaunchedEffect(status.homeId) { exported = null; selected = null; catalogue = null; task = null; failed = false }
-    AmaliaScreen(title = copy[0], onBack = host::goBack, backLabel = copy[1]) { insets ->
-        LazyColumn(contentPadding = insets, modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
-            if (pairing != null) item("automatic-pairing") {
+    AmaliaScreen(title = homeV2SectionTitle(language, section), onBack = host::goBack, backLabel = copy[1]) { insets ->
+        LazyColumn(contentPadding = insets, modifier = Modifier.fillMaxWidth().imePadding(), verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+            if (section == "connection" && pairing != null) item("automatic-pairing") {
                 HomeV2PairingPanel(pairing, status.homeId != null) { invitation ->
                     node.joinHome(invitation)
                     membershipChanged()
                 }
             }
-            item("membership") {
+            if (section == "connection") item("membership") {
                 GlassCard(contentPadding = Spacing.md) {
                     Text(if (status.homeId == null) copy[11] else "${copy[12]} · ${status.homeId}", style = MaterialTheme.typography.bodyLarge)
                     Text("${copy[13]} · ${node.deviceName}", style = MaterialTheme.typography.bodyLarge)
@@ -244,7 +244,10 @@ fun HomeV2Screen(node: HomeV2Node, host: ScreenHost,
             if (failed || status.error != null) item("error") {
                 Text(copy[31], style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
             }
-            if (status.homeId != null) {
+            if (section == "devices" && status.homeId == null) item("join-required") {
+                GlassGroup { SettingsActionRow(copy[11], copy[3], { host.navigate("amalia://screen/house-v2") }) }
+            }
+            if (section == "devices" && status.homeId != null) {
                 item("discovery") { GlassCard(contentPadding = Spacing.md) {
                     SectionTitle(copy[17]); Text(copy[16], style = MaterialTheme.typography.bodyMedium)
                     if (!status.discoveryAvailable) Text(copy[35], style = MaterialTheme.typography.bodyMedium)

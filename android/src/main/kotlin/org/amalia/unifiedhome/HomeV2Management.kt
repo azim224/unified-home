@@ -64,7 +64,8 @@ private data class ManagementProfile(val id: String, val version: Long, val prov
 private data class ManagementPage(
     val profiles: List<ManagementProfile>, val next: String?, val selectionRevision: Long,
 )
-private data class ManagementStatus(val enabled: Boolean, val scheduling: Boolean, val votes: Int, val majority: Int)
+private data class ManagementStatus(val enabled: Boolean, val scheduling: Boolean, val votes: Int, val majority: Int,
+    val voters: List<String>, val preferred: String)
 
 private fun managementPage(value: JSONObject): ManagementPage {
     val profiles = value.getJSONArray("profiles")
@@ -112,6 +113,7 @@ fun HomeV2Management(
     control: HomeV2Control,
     data: HomeV2Data,
     host: ScreenHost,
+    section: String = "coordination",
     onConfigured: suspend () -> Unit,
 ) {
     val language = LocalConfiguration.current.locales[0].language
@@ -155,7 +157,9 @@ fun HomeV2Management(
     suspend fun refreshStatus() {
         val value = withContext(Dispatchers.IO) { control.status() }
         coordination = ManagementStatus(value.optBoolean("enabled"), value.optBoolean("can_schedule"),
-            value.optInt("collected_votes").coerceIn(0, 256), value.optInt("majority").coerceIn(0, 256))
+            value.optInt("collected_votes").coerceIn(0, 256), value.optInt("majority").coerceIn(0, 256),
+            value.optJSONArray("voters")?.let { array -> (0 until array.length()).map { array.getString(it) } } ?: emptyList(),
+            (value.opt("preferred") as? String).orEmpty())
         statusFailed = false
     }
     fun action(block: suspend () -> Unit) {
@@ -193,7 +197,7 @@ fun HomeV2Management(
     val configured = coordination?.enabled == true
     val currentOnConfigured by rememberUpdatedState(onConfigured)
 
-    AmaliaScreen(title = text(ManagementWord.TITLE), onBack = host::goBack, backLabel = text(ManagementWord.BACK)) { insets ->
+    AmaliaScreen(title = homeV2SectionTitle(language, section), onBack = host::goBack, backLabel = text(ManagementWord.BACK)) { insets ->
         LazyColumn(contentPadding = insets, modifier = Modifier.fillMaxWidth().imePadding(),
             verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
             if (!active) item("unavailable") { Text(text(ManagementWord.UNAVAILABLE), style = MaterialTheme.typography.bodyMedium) }
@@ -207,7 +211,7 @@ fun HomeV2Management(
                     }
                 }
             }
-            item("coordination") { GlassCard(contentPadding = Spacing.md) {
+            if (section == "coordination") item("coordination") { GlassCard(contentPadding = Spacing.md) {
                 SectionTitle(text(ManagementWord.COORDINATION))
                 Text(text(ManagementWord.WARNING), style = MaterialTheme.typography.bodyMedium)
                 coordination?.let { state ->
@@ -216,6 +220,12 @@ fun HomeV2Management(
                         Text(text(if (state.scheduling) ManagementWord.SCHEDULING else ManagementWord.WAITING), style = MaterialTheme.typography.bodyMedium)
                         Text("${text(ManagementWord.VOTES)} · ${state.votes} / ${state.majority}", style = MaterialTheme.typography.bodyMedium)
                         Text(text(ManagementWord.CONFIGURED), style = MaterialTheme.typography.bodyMedium)
+                        Text(text(ManagementWord.VOTERS), style = MaterialTheme.typography.labelMedium)
+                        androidx.compose.foundation.text.selection.SelectionContainer {
+                            Text(state.voters.joinToString("\n"), style = MaterialTheme.typography.bodyMedium)
+                        }
+                        Text(text(ManagementWord.PREFERRED), style = MaterialTheme.typography.labelMedium)
+                        Text(state.preferred, style = MaterialTheme.typography.bodyMedium)
                     }
                 }
                 if (statusFailed) Text(text(ManagementWord.ERROR), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
@@ -239,6 +249,7 @@ fun HomeV2Management(
                     }
                 }
             } }
+            if (section == "profiles") {
             item("remote-heading") { GlassCard(contentPadding = Spacing.md) {
                 SectionTitle(text(ManagementWord.REMOTE))
                 if (trustedPeers.isEmpty()) Text(text(ManagementWord.DEVICES_EMPTY), style = MaterialTheme.typography.bodyMedium)
@@ -337,6 +348,7 @@ fun HomeV2Management(
                     }
                 }
             } }
+            }
         }
     }
 }

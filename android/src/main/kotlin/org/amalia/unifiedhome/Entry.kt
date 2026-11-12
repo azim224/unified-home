@@ -1,5 +1,8 @@
 package org.amalia.unifiedhome
 
+import androidx.compose.runtime.getValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.flow.MutableStateFlow
 import com.my.amali.data.ai.AmaliaTool
 import com.my.amali.plugin.AmaliaPlugin
 import com.my.amali.plugin.BackgroundContributor
@@ -68,7 +71,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
     override val metadata: PluginMetadata = PluginMetadata(
         id = "org.amalia.unifiedhome.native",
         name = "Единый дом",
-        version = "1.4.0",
+        version = "1.5.0",
         author = "Amalia",
         description = "Устройства, сцены с подтверждением и локальная сеть Амалии.",
         category = PluginCategory.SCREEN,
@@ -88,6 +91,9 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
     private var homeV2Assistant: org.amalia.unifiedhome.v2.HomeV2Assistant? = null
     private var homeV2Control: org.amalia.unifiedhome.v2.HomeV2Control? = null
     private var homeV2Scheduler: org.amalia.unifiedhome.v2.HomeV2Scheduler? = null
+    // Publish one coherent, observable snapshot only after handlers/storage are ready.
+    private val homeUi = MutableStateFlow<Pair<org.amalia.unifiedhome.v2.HomeV2Control,
+        org.amalia.unifiedhome.v2.HomeV2Data>?>(null)
     private val lifecycleGate = Mutex()
     @Volatile private var engine: HomeEngine? = null
     @Volatile private var routing: HomeRouting? = null
@@ -152,7 +158,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
                 cleanup { homeV2?.stop() }
                 cleanup { homeV2?.setOperationHandler(emptySet(), null) }
                 cleanup { homeV2Scheduler?.closeAndWait() }; homeV2Scheduler = null
-                cleanup { homeV2Data?.closeAndWait() }; homeV2Data = null
+                cleanup { homeV2Data?.closeAndWait() }; homeV2Data = null; homeUi.value = null
                 cleanup { homeV2Assistant?.closeAndWait() }; homeV2Assistant = null
                 cleanup { homeV2Control?.close() }; homeV2Control = null
                 homeV2?.reportInitializationFailure()
@@ -187,7 +193,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
                     node.stop()
                     node.setOperationHandler(emptySet(), null)
                     homeV2Scheduler?.closeAndWait(); homeV2Scheduler = null
-                    homeV2Data?.closeAndWait(); homeV2Data = null
+                    homeV2Data?.closeAndWait(); homeV2Data = null; homeUi.value = null
                     homeV2Assistant?.closeAndWait(); homeV2Assistant = null
                     homeV2Control?.close(); homeV2Control = null
                     val context = appContext ?: return
@@ -221,6 +227,9 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
                     homeV2Data = data
                 }
                 node.start()
+                val readyControl = homeV2Control
+                val readyData = homeV2Data
+                if (readyControl != null && readyData != null) homeUi.value = readyControl to readyData
                 if (homeV2Sync?.isActive != true) {
                     val data = homeV2Data
                     if (data != null) homeV2Sync = scope?.launch {
@@ -264,7 +273,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
             homeV2Scheduler?.closeAndWait()
             homeV2Scheduler = null
             homeV2Data?.closeAndWait()
-            homeV2Data = null
+            homeV2Data = null; homeUi.value = null
             homeV2Assistant?.closeAndWait()
             homeV2Assistant = null
             homeV2Control?.close()
@@ -304,7 +313,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
         homeV2Scheduler = null
         homeV2Control = null
         homeV2Assistant = null
-        homeV2Data = null
+        homeV2Data = null; homeUi.value = null
         scope?.launch(NonCancellable + Dispatchers.IO) { lifecycleGate.withLock {
             pairing?.stop()
             node?.stop()
@@ -404,48 +413,63 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
     override fun screens(): List<ScreenSpec> {
         val home = engine ?: return emptyList()
         val node = homeV2 ?: return emptyList()
-        val management = listOf(
-            ScreenSpec(route="amalia://screen/house-v2-manage",titleRes=0,
-                title=homeV2Title(appContext?.resources?.configuration?.locales?.get(0)?.language.orEmpty()),
-                inNavigation=true,iconName="lamp",content={ screenHost ->
-                    val control = homeV2Control
-                    val data = homeV2Data
-                    if (control != null && data != null) HomeV2Management(node,control,data,screenHost) {
-                        node.stop()
-                        val assistant = homeV2Assistant
-                        val scheduled = org.amalia.unifiedhome.v2.HomeV2ScheduleReceiver(services ?: return@HomeV2Management,data.homeId,control)
-                        node.setOperationHandler(data.operations + (assistant?.operations ?: emptySet()) + control.operations + scheduled.operations) { operation,args,from ->
-                            when (operation) {
-                                in control.operations -> control.handle(operation,args,from)
-                                in scheduled.operations -> scheduled.handle(operation,args,from)
-                                in (assistant?.operations ?: emptySet()) -> assistant?.handle(operation,args,from)
-                                else -> data.handle(operation,args,from)
+        fun title(section: String) = homeV2SectionTitle(
+            appContext?.resources?.configuration?.locales?.get(0)?.language.orEmpty(), section)
+        fun management(route: String, section: String) = ScreenSpec(
+            route = route, titleRes = 0, title = title(section), inNavigation = false, iconName = "lamp",
+            content = { screenHost ->
+                val resources by homeUi.collectAsStateWithLifecycle()
+                val status by node.status.collectAsStateWithLifecycle()
+                val ready = resources
+                if (ready != null && ready.second.homeId == status.homeId && status.running) {
+                    HomeV2Management(node, ready.first, ready.second, screenHost, section) {
+                        lifecycleGate.withLock {
+                            check(enabled && homeV2Data === ready.second && homeV2Control === ready.first &&
+                                node.status.value.homeId == ready.second.homeId)
+                            node.stop()
+                            val data = ready.second
+                            val control = ready.first
+                            val assistant = homeV2Assistant
+                            val scheduled = org.amalia.unifiedhome.v2.HomeV2ScheduleReceiver(
+                                services ?: error("host_unavailable"), data.homeId, control)
+                            node.setOperationHandler(data.operations + (assistant?.operations ?: emptySet()) +
+                                control.operations + scheduled.operations) { operation, args, from ->
+                                when (operation) {
+                                    in control.operations -> control.handle(operation, args, from)
+                                    in scheduled.operations -> scheduled.handle(operation, args, from)
+                                    in (assistant?.operations ?: emptySet()) -> assistant?.handle(operation, args, from)
+                                    else -> data.handle(operation, args, from)
+                                }
                             }
+                            node.start()
                         }
-                        node.start()
-                    } else HomeV2Screen(node,screenHost, homePairing) { reconcileHomeNetworks() }
-                })
-        )
-        return management + listOf(
-            ScreenSpec(
-                route = "amalia://screen/house-v2-notes", titleRes = 0,
+                    }
+                } else HomeV2Unavailable(node, screenHost) { scope?.launch { reconcileHomeNetworks() } }
+            })
+        return listOf(
+            ScreenSpec(route = "amalia://screen/house-v2-home", titleRes = 0,
+                title = homeV2HubTitle(appContext?.resources?.configuration?.locales?.get(0)?.language.orEmpty()),
+                inNavigation = true, iconName = "lamp", content = { host -> HomeV2Hub(node, host) }),
+            management("amalia://screen/house-v2-manage", "coordination"),
+            management("amalia://screen/house-v2-profiles", "profiles"),
+            ScreenSpec(route = "amalia://screen/house-v2-notes", titleRes = 0,
                 title = homeV2NotesTitle(appContext?.resources?.configuration?.locales?.get(0)?.language.orEmpty()),
-                inNavigation = true, iconName = "lamp",
-                content = { host -> HomeV2Notes(homeV2, homeV2Data, host) },
-            ),
-            ScreenSpec(
-                route = "amalia://screen/house-v2", titleRes = 0,
-                title = homeV2Title(appContext?.resources?.configuration?.locales?.get(0)?.language.orEmpty()), inNavigation = true, iconName = "lamp",
-                content = { host -> HomeV2Screen(node, host, homePairing) { reconcileHomeNetworks() } },
-            ),
-            ScreenSpec(
-                route = "amalia://screen/house",
-                titleRes = 0,
-                title = "Единый дом",
-                inNavigation = false,
-                iconName = "lamp",
-                content = { host -> HomeScreen(home, host, settingsTransfer) },
-            ),
+                inNavigation = false, iconName = "lamp", content = { host ->
+                    val resources by homeUi.collectAsStateWithLifecycle()
+                    val status by node.status.collectAsStateWithLifecycle()
+                    val ready = resources
+                    if (ready != null && ready.second.homeId == status.homeId && status.running)
+                        HomeV2Notes(node, ready.second, host)
+                    else HomeV2Unavailable(node, host) { scope?.launch { reconcileHomeNetworks() } }
+                }),
+            ScreenSpec(route = "amalia://screen/house-v2", titleRes = 0,
+                title = title("connection"), inNavigation = false, iconName = "lamp",
+                content = { host -> HomeV2Screen(node, host, homePairing) { reconcileHomeNetworks() } }),
+            ScreenSpec(route = "amalia://screen/house-v2-devices", titleRes = 0,
+                title = title("devices"), inNavigation = false, iconName = "lamp",
+                content = { host -> HomeV2Screen(node, host, section = "devices") { reconcileHomeNetworks() } }),
+            ScreenSpec(route = "amalia://screen/house", titleRes = 0, title = title("legacy"),
+                inNavigation = false, iconName = "lamp", content = { host -> HomeScreen(home, host, settingsTransfer) }),
         )
     }
 
