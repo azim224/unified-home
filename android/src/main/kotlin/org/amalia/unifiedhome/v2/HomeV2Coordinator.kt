@@ -304,7 +304,7 @@ class HomeV2Coordinator(
     }
 
     /** Stop/await the caller-owned pump before close. Never revokes voter grants. */
-    override fun close() = synchronized(serial) {
+    override fun close(): Unit = synchronized(serial) {
         round = null
         try { db?.close() }
         finally {
