@@ -421,7 +421,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
                 val resources by homeUi.collectAsStateWithLifecycle()
                 val status by node.status.collectAsStateWithLifecycle()
                 val ready = resources
-                if (ready != null && ready.second.homeId == status.homeId && status.running) {
+                if (ready != null && ready.second.homeId == status.homeId) {
                     HomeV2Management(node, ready.first, ready.second, screenHost, section) {
                         lifecycleGate.withLock {
                             check(enabled && homeV2Data === ready.second && homeV2Control === ready.first &&
@@ -458,7 +458,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
                     val resources by homeUi.collectAsStateWithLifecycle()
                     val status by node.status.collectAsStateWithLifecycle()
                     val ready = resources
-                    if (ready != null && ready.second.homeId == status.homeId && status.running)
+                    if (ready != null && ready.second.homeId == status.homeId)
                         HomeV2Notes(node, ready.second, host)
                     else HomeV2Unavailable(node, host) { scope?.launch { reconcileHomeNetworks() } }
                 }),
