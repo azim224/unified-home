@@ -426,6 +426,9 @@ class HomeV2Data(
 
     private suspend fun applyFullProfile(adapter: SettingsAdapter, before: JSONObject,
         ref: JSONObject, stored: JSONObject): JSONObject {
+        // Incomplete alias-only profiles must not silently clear active credentials.
+        requireData(setOf("chat_api_key", "chat_base_url", "chat_model").all { stored.has(it) },
+            "incomplete_provider_profile")
         val current = adapter.exportProviderProfile()
         // Build a host-only envelope. PC-only fields stay in the encrypted stored version.
         // Portable chat fields are authoritative after PC edits; omit ALL raw chat aliases
