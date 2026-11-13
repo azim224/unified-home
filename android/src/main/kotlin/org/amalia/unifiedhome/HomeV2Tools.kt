@@ -159,13 +159,17 @@ fun homeV2Tools(node: HomeV2Node): List<AmaliaTool> {
             fun code(value: String?) = value?.takeIf { it.matches(Regex("[a-z][a-z0-9_.]{0,63}")) }
             fun finish(error: String? = null): ToolOutcome {
                 if (error != null) out.put("error", code(error) ?: "request_failed")
+                // Existing host honesty gate reads status, not receipt state.
+                // A successful tool transport must not turn pending work into DONE.
+                out.put("status", if (out.optBoolean("ok") && out.optString("state") == "succeeded")
+                    "completed" else "pending")
                 // Bound the entire encoded output, including JSON escaping and UTF-8, not just text.
                 val result = out.optJSONObject("result")
                 var encoded = out.toString()
                 while (encoded.length > 14000 || encoded.toByteArray(Charsets.UTF_8).size >= 60000) {
                     val text = result?.opt("text") as? String
                     if (text == null || text.isEmpty()) {
-                        out.put("ok", false).put("result", JSONObject.NULL).put("error", "response_too_large")
+                        out.put("ok", false).put("status", "pending").put("result", JSONObject.NULL).put("error", "response_too_large")
                     } else {
                         var end = text.length / 2
                         if (end > 0 && text[end - 1].isHighSurrogate()) end--
