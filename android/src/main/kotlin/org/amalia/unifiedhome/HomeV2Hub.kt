@@ -127,7 +127,12 @@ fun HomeV2Hub(node: HomeV2Node, host: ScreenHost) {
             }
             item(key = "profiles", contentType = "section") {
                 SectionTitle(homeV2SectionTitle(language, "profiles"))
-                GlassGroup { HubLink(copy, HubWord.PROFILE_LIST, HubWord.PROFILE_HINT, HUB_PROFILES, host) }
+                GlassGroup {
+                    HubLink(copy, HubWord.PROFILE_LIST, HubWord.PROFILE_HINT, HUB_PROFILES, host)
+                    GlassDivider()
+                    SettingsActionRow(title = providerSettingsLabel(language), subtitle = "LLM · STT · TTS",
+                        onClick = { host.navigate("settings/api") })
+                }
             }
             item(key = "coordination", contentType = "section") {
                 SectionTitle(homeV2SectionTitle(language, "coordination"))
@@ -171,4 +176,16 @@ fun HomeV2Unavailable(node: HomeV2Node, host: ScreenHost, retry: () -> Unit) {
             }
         }
     }
+}
+
+private fun providerSettingsLabel(language: String): String = when (language) {
+    "ru" -> "Настройки API и моделей этого устройства"
+    "ja" -> "この端末のAPIとモデル設定"
+    "de" -> "API und Modelle dieses Geräts"
+    "es" -> "API y modelos de este dispositivo"
+    "fr" -> "API et modèles de cet appareil"
+    "zh" -> "本机 API 与模型设置"
+    "hi" -> "इस डिवाइस की API और मॉडल सेटिंग"
+    "ar" -> "إعدادات API والنماذج لهذا الجهاز"
+    else -> "This device's API and model settings"
 }
