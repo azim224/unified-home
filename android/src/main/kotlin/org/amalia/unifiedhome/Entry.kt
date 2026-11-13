@@ -71,7 +71,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
     override val metadata: PluginMetadata = PluginMetadata(
         id = "org.amalia.unifiedhome.native",
         name = "Единый дом",
-        version = "1.6.0",
+        version = "1.7.0",
         author = "Amalia",
         description = "Устройства, сцены с подтверждением и локальная сеть Амалии.",
         category = PluginCategory.SCREEN,
@@ -209,7 +209,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
                     })
                     val assistant = org.amalia.unifiedhome.v2.HomeV2Assistant(context, host, data.homeId, scope ?: return)
                         .also { homeV2Assistant = it }
-                    val control = org.amalia.unifiedhome.v2.HomeV2Control(context,node,data.homeId)
+                    val control = org.amalia.unifiedhome.v2.HomeV2Control(context,node,data.homeId,host)
                         .also { homeV2Control = it }
                     val scheduled = org.amalia.unifiedhome.v2.HomeV2ScheduleReceiver(host,data.homeId,control)
                     node.setOperationHandler(data.operations + assistant.operations + control.operations + scheduled.operations) { operation, args, from ->
@@ -360,7 +360,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
 
     /** Typed host callback: metadata only, before wake acknowledgement or recording starts. */
     override suspend fun arbitrateWake(request: WakeArbitrationRequest): Boolean {
-        if (homeV2?.status?.value?.homeId != null) return true
+        if (homeV2?.status?.value?.homeId != null) return homeV2Control?.voice?.permitsLocalWake() ?: false
         val mesh = engine?.mesh ?: return true
         // An unconfigured installation keeps local voice. A joined household
         // with failed transport cannot prove that another microphone is idle.
@@ -393,7 +393,10 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
     }
 
     override suspend fun routeHomeText(request: HomeTextRequest): HomeTextRoute? {
-        if (homeV2?.status?.value?.homeId != null) return null
+        if (homeV2?.status?.value?.homeId != null) {
+            val voice = homeV2Control?.voice ?: return HomeTextRoute(error = "home_not_running")
+            return voice.route(request)
+        }
         val router = routing ?: return null
         val id = UUID.nameUUIDFromBytes(request.requestId.toByteArray(Charsets.UTF_8)).toString().replace("-", "")
         val result = router.route(id, request.text) ?: return null
@@ -496,7 +499,7 @@ class HomeProduct : AmaliaPlugin, ScreenContributor, ToolContributor, PromptCont
                 "home_v2_speech_get with the SAME ID. queued/running is not completed playback. " +
                 "Show exact returned task error_code when speech fails; do not hide it as generic tool failure. " +
                 "Use home_v2_context for selected remote context and home_v2_profiles for metadata only; " +
-                "never request secret profile exports through a model tool. No voice or schedule coordination is claimed.",
+                "never request secret profile exports through a model tool. Explicit local brain/responder/listener choices route foreground turns over v3 receipts; no automatic wake election is claimed.",
         )
         if (homeV2?.status?.value?.homeId != null) return
         builder.block(

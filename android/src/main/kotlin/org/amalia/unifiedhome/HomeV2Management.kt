@@ -60,6 +60,19 @@ private fun managementCopy(language: String): List<String> = (when (language) {
     else -> "Home management|Back|Coordination|Fixed voter IDs (comma-separated)|Preferred node ID|The list and preferred node must be identical on every node. Discovery does not define quorum. Once saved, the list cannot be changed in place.|Save and connect|Enabled|Disabled|Scheduling allowed|Waiting for quorum|Votes / majority|Refresh|Another device’s profiles|No verified devices in this home.|Select|Selected|Load profiles|Next page|No profiles|Import selected profile|Local profiles|New profile ID|Snapshot name|Capture current full host profile|Apply selected profile|This changes this device’s settings. The handler preserves a backup; secret values are never displayed.|Working…|Not completed. Check network, inputs and host support, then explicitly retry.|Retry|Done|Join a home and enable it before managing it.|Version|Configuration is fixed. Changes require a new home; reconnecting does not change the list.|Enter 1–256 unique IDs of 32 lowercase hexadecimal characters, including this node and the preferred node."
 }).split('|')
 
+/** Routing is local to this home/device, independent of fixed quorum membership. */
+private fun managementVoiceCopy(language: String): List<String> = (when (language) {
+    "ru" -> "Голосовые роли|Явные предпочтения этого устройства для этого дома; без автоматических выборов. На выбранном слушателе должно быть включено локальное пробуждение. Нет скрытого перехода на другой узел. Обнаруженные данные не проверены до подтверждения; сохранение проверяет удалённые узлы.|Сохранить роли|Не проверено"
+    "ja" -> "音声の役割|このホームでのこの端末の明示的な設定です。自動選出はありません。選択したリスナーではローカルのウェイク機能を有効にしてください。暗黙の代替はありません。検出情報は確認されるまで未検証です。保存時にリモート端末を検証します。|役割を保存|未検証"
+    "de" -> "Sprachrollen|Explizite lokale Einstellungen für dieses Zuhause; keine automatische Wahl. Beim gewählten Listener muss die lokale Aktivierung eingeschaltet sein. Kein stiller Ersatz. Erkannte Angaben sind bis zur Prüfung unbestätigt; Speichern prüft entfernte Geräte.|Rollen speichern|Ungeprüft"
+    "es" -> "Roles de voz|Preferencias locales explícitas para este hogar; sin elección automática. El oyente elegido debe tener activada la detección local de la palabra de activación. Sin sustitución silenciosa. Los datos descubiertos no son fiables hasta verificarlos; al guardar se verifican los dispositivos remotos.|Guardar roles|Sin verificar"
+    "fr" -> "Rôles vocaux|Préférences locales explicites pour cette maison, sans élection automatique. L’écoute choisie doit avoir le réveil vocal local activé. Aucun remplacement silencieux. Les données découvertes ne sont pas fiables avant vérification ; l’enregistrement vérifie les appareils distants.|Enregistrer les rôles|Non vérifié"
+    "zh" -> "语音角色|此设备在本家庭的明确本地偏好，不自动选举。所选监听设备必须启用本地唤醒。不会静默切换备用设备。发现信息在验证前不可信；保存时会验证远程设备。|保存角色|未验证"
+    "hi" -> "आवाज़ की भूमिकाएँ|इस घर के लिए इस डिवाइस की स्पष्ट स्थानीय प्राथमिकताएँ; कोई स्वचालित चुनाव नहीं। चुने गए श्रोता पर स्थानीय वेक सक्रिय होना चाहिए। चुपचाप दूसरे नोड पर नहीं जाएगा। खोजी गई जानकारी सत्यापन तक अविश्वसनीय है; सहेजते समय दूरस्थ डिवाइस सत्यापित होते हैं।|भूमिकाएँ सहेजें|असत्यापित"
+    "ar" -> "أدوار الصوت|تفضيلات محلية صريحة لهذا الجهاز في هذا المنزل؛ بلا انتخاب تلقائي. يجب تفعيل الاستيقاظ المحلي على المستمع المختار. لا استبدال صامت. بيانات الاكتشاف غير موثوقة حتى التحقق؛ يجري التحقق من الأجهزة البعيدة عند الحفظ.|حفظ الأدوار|غير متحقق"
+    else -> "Voice roles|Explicit local preferences for this home; no automatic election. The selected listener must have local wake enabled. No silent fallback. Discovered details are untrusted until verified; saving verifies remote devices.|Save roles|Unverified"
+}).split('|')
+
 private data class ManagementProfile(val id: String, val version: Long, val provider: String, val label: String)
 private data class ManagementPage(
     val profiles: List<ManagementProfile>, val next: String?, val selectionRevision: Long,
@@ -118,6 +131,13 @@ fun HomeV2Management(
 ) {
     val language = LocalConfiguration.current.locales[0].language
     val words = remember(language) { managementCopy(language) }
+    val voiceCopy = remember(language) { managementVoiceCopy(language) }
+    val roleCopy = remember(language) { coordinationCopyFor(language) }
+    val thisDevice = remember(language) { copyFor(language).thisNode }
+    val voiceRoles = remember { listOf("brain", "responder", "listener") }
+    var savedVoice by remember(control, data.homeId) { mutableStateOf<Map<String, String>?>(null) }
+    var voiceDraft by remember(control, data.homeId) { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var voiceLoadFailed by remember(control, data.homeId) { mutableStateOf(false) }
     fun text(word: ManagementWord) = words[word.ordinal]
     val membership by node.status.collectAsStateWithLifecycle()
     val peers by node.peers.collectAsStateWithLifecycle()
@@ -162,6 +182,18 @@ fun HomeV2Management(
             (value.opt("preferred") as? String).orEmpty())
         statusFailed = false
     }
+    suspend fun loadVoice() {
+        checkHome()
+        val value = withContext(Dispatchers.IO) { control.voice.preferences() }
+        val loaded = voiceRoles.associateWith { value.getString(it) }
+        checkHome()
+        savedVoice = loaded; voiceDraft = loaded; voiceLoadFailed = false
+    }
+    fun voiceSelectionValid(selection: Map<String, String>): Boolean = voiceRoles.all { role ->
+        val id = selection[role]
+        id == "" || (id != null && id.matches(Regex("[0-9a-f]{32}")) &&
+            node.peers.value.any { it.homeId == data.homeId && it.nodeId == id && it.nodeId != membership.nodeId })
+    }
     fun action(block: suspend () -> Unit) {
         if (busy) return
         busy = true; failed = false; done = false; retry = null
@@ -181,6 +213,14 @@ fun HomeV2Management(
                 catch (_: Exception) { statusFailed = true }
                 delay(1000)
             }
+        }
+    }
+    // Discovery/status refreshes must never reload or normalize the user's routing draft.
+    LaunchedEffect(control, data.homeId, active, section) {
+        if (active && section == "coordination" && savedVoice == null) {
+            try { loadVoice() }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { voiceLoadFailed = true }
         }
     }
     LaunchedEffect(membership.homeId, membership.running) {
@@ -211,6 +251,51 @@ fun HomeV2Management(
                     }
                 }
             }
+            if (section == "coordination") item("voice-routing") { GlassCard(contentPadding = Spacing.md) {
+                SectionTitle(voiceCopy[0])
+                Text(voiceCopy[1], style = MaterialTheme.typography.bodyMedium)
+                if (voiceLoadFailed) {
+                    Text(text(ManagementWord.ERROR), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+                    ManagementButton(text(ManagementWord.RETRY), enabled) { action { loadVoice() } }
+                } else if (savedVoice == null && active) {
+                    Text(text(ManagementWord.WORKING), style = MaterialTheme.typography.bodyMedium)
+                }
+                val candidates = peers.filter { it.homeId == data.homeId && it.nodeId != membership.nodeId &&
+                    it.nodeId.matches(Regex("[0-9a-f]{32}")) }.distinctBy { it.nodeId }.sortedBy { it.nodeId }
+                voiceRoles.forEach { role ->
+                    val selected = voiceDraft[role]
+                    Text(roleCopy.roleLabel(role), style = MaterialTheme.typography.labelMedium)
+                    fun choiceLabel(label: String, id: String) = if (selected == id)
+                        "$label · ${text(ManagementWord.SELECTED)}" else label
+                    ManagementButton(choiceLabel(thisDevice, ""), enabled && savedVoice != null) {
+                        voiceDraft = voiceDraft + (role to "")
+                    }
+                    if (!selected.isNullOrEmpty() && candidates.none { it.nodeId == selected }) {
+                        Text("$selected · ${roleCopy.unavailable} · ${text(ManagementWord.SELECTED)}",
+                            style = MaterialTheme.typography.bodyMedium)
+                    }
+                    candidates.forEach { candidate ->
+                        // Never present an unauthenticated advertisement's name as a trusted device label.
+                        val label = if (candidate.authenticated) {
+                            val name = candidate.name.filterNot { it.isISOControl() }.take(80)
+                            if (name.isBlank()) candidate.nodeId else "$name · ${candidate.nodeId}"
+                        } else "${candidate.nodeId} · ${voiceCopy[3]}"
+                        ManagementButton(choiceLabel(label, candidate.nodeId), enabled && savedVoice != null) {
+                            voiceDraft = voiceDraft + (role to candidate.nodeId)
+                        }
+                    }
+                }
+                ManagementButton(voiceCopy[2], enabled && savedVoice != null && voiceDraft != savedVoice && voiceSelectionValid(voiceDraft)) {
+                    val selection = voiceDraft.toMap()
+                    action {
+                        // An explicit retry must not overwrite a newer draft or re-save an unchanged choice.
+                        check(selection == voiceDraft && selection != savedVoice && voiceSelectionValid(selection))
+                        control.voice.configure(selection.getValue("brain"), selection.getValue("responder"), selection.getValue("listener"))
+                        checkHome()
+                        savedVoice = selection
+                    }
+                }
+            } }
             if (section == "coordination") item("coordination") { GlassCard(contentPadding = Spacing.md) {
                 SectionTitle(text(ManagementWord.COORDINATION))
                 Text(text(ManagementWord.WARNING), style = MaterialTheme.typography.bodyMedium)

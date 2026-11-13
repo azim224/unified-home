@@ -11,7 +11,8 @@ import java.io.Closeable
 
 /** Explicit fixed-voter configuration; discovery NEVER changes voting membership. */
 class HomeV2Control(private val context: Context, val node: HomeV2Node,
-    private val home: String) : Closeable {
+    private val home: String, host: com.my.amali.plugin.HostServices) : Closeable {
+    val voice = HomeV2Routing(context, node, home, host)
     private val config = AtomicFile(File(context.noBackupFilesDir, "home-v3-voters-$home.json"))
     private var coordinator: HomeV2Coordinator? = null
     val operations get() = coordinator?.operations ?: emptySet()
