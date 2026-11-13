@@ -133,6 +133,7 @@ fun HomeV2Screen(node: HomeV2Node, host: ScreenHost,
     var taskId by remember(contextToken) { mutableStateOf("") }
     var catalogue by remember(contextToken) { mutableStateOf<JSONObject?>(null) }
     var task by remember(contextToken) { mutableStateOf<JSONObject?>(null) }
+    var liveState by remember(contextToken) { mutableStateOf<JSONObject?>(null) }
     var diagnostic by remember(contextToken) { mutableStateOf<V2Diagnostic?>(null) }
     var query by remember(contextToken) { mutableStateOf("") }
     var detail by remember(contextToken) { mutableStateOf<JSONObject?>(null) }
@@ -282,6 +283,12 @@ fun HomeV2Screen(node: HomeV2Node, host: ScreenHost,
                     Text(peer.name.ifBlank { peer.nodeId }, style = MaterialTheme.typography.bodyLarge)
                     Text("${peer.nodeId} · ${peer.address}:${peer.port}", style = MaterialTheme.typography.bodyMedium)
                     V2Button(tools[2], !busy) { checkLink(peer.nodeId, peer.address, peer.port) }
+                    V2Button(liveStateLabel(language), !busy) {
+                        action { liveState = request(peer, "device.state", JSONObject()) }
+                    }
+                    liveState?.let { snapshot ->
+                        Text(snapshot.toString(2).take(12000), style = MaterialTheme.typography.bodyMedium)
+                    }
                     SectionTitle(copy[25])
                     V2Button(copy[26], !busy) { detail = null; submitConfirmation = false
                         action { catalogue = request(peer, "capabilities.list", org.json.JSONObject()) } }
@@ -386,3 +393,15 @@ private fun v2TaskState(state: String, language: String): String {
 }
 
 internal fun homeV2Title(language: String): String = v2Copy(language)[0]
+
+private fun liveStateLabel(language: String): String = when (language) {
+    "ru" -> "Время, заряд и система"
+    "ja" -> "時刻・電池・システム"
+    "de" -> "Zeit, Akku und System"
+    "es" -> "Hora, batería y sistema"
+    "fr" -> "Heure, batterie et système"
+    "zh" -> "时间、电池与系统"
+    "hi" -> "समय, बैटरी और सिस्टम"
+    "ar" -> "الوقت والبطارية والنظام"
+    else -> "Live time, battery and system"
+}

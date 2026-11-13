@@ -5,7 +5,6 @@ import android.database.sqlite.SQLiteDatabase
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
-import com.my.amali.data.ai.FishAudioTTS
 import com.my.amali.data.ai.ModelCatalog
 import com.my.amali.plugin.HostServices
 import kotlinx.coroutines.CancellationException
@@ -324,7 +323,7 @@ class HomeV2Data(
         values.put("fish_model", ModelCatalog.resolveForRequest(
             ModelCatalog.Provider.FISH_AUDIO, values.optString("fish_model")))
         values.put("fish_reference_id", values.optString("fish_reference_id").trim()
-            .ifBlank { FishAudioTTS.DEFAULT_REFERENCE_ID })
+            .ifBlank { "096d410e860346a7a73762d557a290d7" })
         val strings = JSONObject()
         values.keys().forEach { key -> strings.put(key, values.get(key).toString()) }
         return transaction { importProfile(JSONObject().put("id", a.getString("id"))
